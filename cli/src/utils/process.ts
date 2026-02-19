@@ -1,11 +1,15 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { logPrefix } from "../config";
 
-export function runCommand(command: string, args: string[], cwd: string): Promise<number> {
+type RunCommandOptions = {
+  silent?: boolean;
+};
+
+export function runCommand(command: string, args: string[], cwd: string, options?: RunCommandOptions): Promise<number> {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       cwd,
-      stdio: "inherit",
+      stdio: options?.silent ? "ignore" : "inherit",
       env: process.env,
       windowsHide: true
     });

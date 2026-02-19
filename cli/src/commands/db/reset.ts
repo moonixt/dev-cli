@@ -22,6 +22,13 @@ export function registerDbCommands(program: Command): void {
 }
 
 export async function runDbReset(options: DbResetOptions): Promise<number> {
+  return runDbResetWithOutput(options, { silent: false });
+}
+
+export async function runDbResetWithOutput(
+  options: DbResetOptions,
+  outputOptions: { silent: boolean }
+): Promise<number> {
   const sqlFilePath = path.join(repoRoot, "docs", "queryreset.txt");
   if (!fs.existsSync(sqlFilePath)) {
     console.error(`${logPrefix} query file not found: ${sqlFilePath}`);
@@ -55,7 +62,7 @@ export async function runDbReset(options: DbResetOptions): Promise<number> {
     return 1;
   }
 
-  const args = ["-b", "-S", server, "-d", database, "-i", sqlFilePath];
+  const args = ["-b", "-I", "-S", server, "-d", database, "-i", sqlFilePath];
   if (trustServerCertificate) {
     args.push("-C");
   }
@@ -66,7 +73,7 @@ export async function runDbReset(options: DbResetOptions): Promise<number> {
     args.push("-U", user as string, "-P", password as string);
   }
 
-  return runCommand("sqlcmd", args, repoRoot);
+  return runCommand("sqlcmd", args, repoRoot, { silent: outputOptions.silent });
 }
 
 function parseBooleanEnv(value: string | undefined): boolean | undefined {

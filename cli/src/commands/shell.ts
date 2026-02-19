@@ -1,6 +1,6 @@
 import readline from "node:readline";
 import { Command } from "commander";
-import { runDbReset } from "./db/reset";
+import { runDbResetWithOutput } from "./db/reset";
 import { assertPathsExist, getServiceConfig } from "../services/service-config";
 import { shellCommandNames } from "../shell/commands";
 import { filterShellCommands, printShellHelp, renderLiveShell, renderShellHome } from "../shell/render";
@@ -99,6 +99,12 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
       if (stdin.isTTY) {
         stdin.setRawMode(false);
       }
+      if (suggestions.length > 0) {
+        // Cursor stays on the input row while suggestions are drawn below.
+        // Move to the bottom and clear so command output does not overlap suggestion text.
+        readline.moveCursor(process.stdout, 0, suggestions.length);
+      }
+      readline.clearScreenDown(process.stdout);
       process.stdout.write("\n");
 
       const result = await handleShellInput(command, services, shellState);
@@ -401,7 +407,7 @@ async function handleShellInput(
   }
 
   if (normalized === "/db reset") {
-    const exitCode = await runDbReset({});
+    const exitCode = await runDbResetWithOutput({}, { silent: true });
     setShellMessage(shellState, exitCode === 0 ? "queryreset executed successfully" : "queryreset failed");
     return { continueShell: true, exitCode };
   }
