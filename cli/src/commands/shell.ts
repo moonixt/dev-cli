@@ -8,7 +8,10 @@ import {
   clearLogs,
   createShellState,
   getRunningSummary,
+  resetFocusedLogScroll,
+  scrollFocusedLog,
   setLogView,
+  setSplitLogFocus,
   setShellMessage,
   startBackground,
   stopAllRunning,
@@ -44,11 +47,16 @@ async function runShell(services: Record<ServiceName, ServiceConfig>): Promise<n
 function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState: ShellState): Promise<number> {
   return new Promise((resolve) => {
     const stdin = process.stdin;
+    const logScrollStep = 5;
+    const logPageStep = 12;
     let lastExitCode = 0;
     let input = "";
     let selectedIndex = 0;
     let busy = false;
     let closed = false;
+    const onSignal = (): void => {
+      cleanup(130);
+    };
 
     const cleanup = (exitCode: number): void => {
       if (closed) {
@@ -59,6 +67,8 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
 
       closed = true;
       stdin.off("keypress", onKeypress);
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
       shellState.onChange = undefined;
       if (stdin.isTTY) {
         stdin.setRawMode(false);
@@ -71,7 +81,7 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
     const executeInput = async (): Promise<void> => {
       let command = input.trim();
       const suggestions = filterShellCommands(input);
-      if (command.length > 1 && suggestions.length > 0) {
+      if (command.startsWith("/") && suggestions.length > 0) {
         const selected = suggestions[Math.max(0, Math.min(selectedIndex, suggestions.length - 1))];
         const isExactCommand = shellCommandNames.includes(command);
         if (!isExactCommand) {
@@ -105,6 +115,60 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
       renderLiveShell(input, selectedIndex, shellState);
     };
 
+    const getLogPanelHeight = (): number => {
+      const rows = process.stdout.rows ?? 40;
+      return Math.max(6, Math.min(18, rows - 20));
+    };
+
+    const handleLogNavigationKey = (str: string, key: readline.Key): boolean => {
+      if (shellState.logView === "off") {
+        return false;
+      }
+
+      if (shellState.logView === "all" && input.length === 0) {
+        if (str === "[") {
+          setSplitLogFocus(shellState, "api");
+          return true;
+        }
+        if (str === "]") {
+          setSplitLogFocus(shellState, "sasa");
+          return true;
+        }
+      }
+
+      if (key.name === "pageup") {
+        scrollFocusedLog(shellState, logPageStep, getLogPanelHeight());
+        return true;
+      }
+
+      if (key.name === "pagedown") {
+        scrollFocusedLog(shellState, -logPageStep, getLogPanelHeight());
+        return true;
+      }
+
+      if (key.name === "home") {
+        scrollFocusedLog(shellState, Number.MAX_SAFE_INTEGER, getLogPanelHeight());
+        return true;
+      }
+
+      if (key.name === "end") {
+        resetFocusedLogScroll(shellState);
+        return true;
+      }
+
+      if (key.ctrl && key.name === "up") {
+        scrollFocusedLog(shellState, logScrollStep, getLogPanelHeight());
+        return true;
+      }
+
+      if (key.ctrl && key.name === "down") {
+        scrollFocusedLog(shellState, -logScrollStep, getLogPanelHeight());
+        return true;
+      }
+
+      return false;
+    };
+
     const onKeypress = (str: string, key: readline.Key): void => {
       if (closed || busy) {
         return;
@@ -112,6 +176,10 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
 
       if (key.ctrl && key.name === "c") {
         cleanup(130);
+        return;
+      }
+
+      if (handleLogNavigationKey(str, key)) {
         return;
       }
 
@@ -179,6 +247,8 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
     }
     stdin.resume();
     stdin.on("keypress", onKeypress);
+    process.on("SIGINT", onSignal);
+    process.on("SIGTERM", onSignal);
     shellState.onChange = () => {
       if (!closed && !busy) {
         renderLiveShell(input, selectedIndex, shellState);
@@ -202,6 +272,15 @@ function runShellFallback(services: Record<ServiceName, ServiceConfig>, shellSta
       prompt: "> ",
       completer: shellCompleter
     });
+    const onSignal = (): void => {
+      if (closing) {
+        return;
+      }
+      closing = true;
+      lastExitCode = 130;
+      stopAllRunning(shellState);
+      rl.close();
+    };
 
     renderShellHome(shellState);
     rl.prompt();
@@ -235,8 +314,12 @@ function runShellFallback(services: Record<ServiceName, ServiceConfig>, shellSta
       queue.push(line);
       void processQueue();
     });
+    process.on("SIGINT", onSignal);
+    process.on("SIGTERM", onSignal);
 
     rl.on("close", () => {
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
       stopAllRunning(shellState);
       resolve(lastExitCode);
     });
@@ -284,6 +367,18 @@ async function handleShellInput(
   if (input === "/logs clear") {
     clearLogs(shellState);
     setShellMessage(shellState, "logs cleared");
+    return { continueShell: true, exitCode: 0 };
+  }
+
+  if (input === "/logs" || input === "logs") {
+    setLogView(shellState, "all");
+    setShellMessage(shellState, "log view set to all");
+    return { continueShell: true, exitCode: 0 };
+  }
+
+  if (input === "/logs off") {
+    setLogView(shellState, "off");
+    setShellMessage(shellState, "logs hidden");
     return { continueShell: true, exitCode: 0 };
   }
 

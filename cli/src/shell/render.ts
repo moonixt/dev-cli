@@ -1,7 +1,14 @@
 import readline from "node:readline";
 import { ansiRed, ansiReset, cliVersion, repoRoot } from "../config";
 import { shellCommands } from "./commands";
-import { getRunningSummary, getVisibleLogs, isSuggestionRunning } from "./state";
+import {
+  getLogScrollOffset,
+  getRunningSummary,
+  getServiceLogs,
+  getSplitLogFocus,
+  getVisibleLogs,
+  isSuggestionRunning
+} from "./state";
 import type { ShellCommand, ShellState } from "../types";
 
 export function printShellHelp(): void {
@@ -78,10 +85,20 @@ function printShellHeader(shellState: ShellState): void {
 }
 
 function renderLogPanel(shellState: ShellState): void {
+  if (shellState.logView === "off") {
+    return;
+  }
+
+  if (shellState.logView === "all") {
+    renderSplitLogPanel(shellState);
+    return;
+  }
+
   const logLines = getVisibleLogs(shellState, getLogPanelHeight());
   const width = Math.max(60, (process.stdout.columns ?? 120) - 2);
+  const offset = getLogScrollOffset(shellState, shellState.logView);
 
-  process.stdout.write(`Logs (${shellState.logView}):\n`);
+  process.stdout.write(`Logs (${shellState.logView}, scroll +${offset}):\n`);
   if (logLines.length === 0) {
     process.stdout.write("  (no logs yet)\n\n");
     return;
@@ -92,6 +109,34 @@ function renderLogPanel(shellState: ShellState): void {
     const line = `${prefix} ${entry.line}`;
     process.stdout.write(`${truncateLine(line, width)}\n`);
   }
+  process.stdout.write("\n");
+}
+
+function renderSplitLogPanel(shellState: ShellState): void {
+  const panelHeight = getLogPanelHeight();
+  const width = Math.max(60, (process.stdout.columns ?? 120) - 2);
+  const separator = " | ";
+  const columnWidth = Math.max(24, Math.floor((width - separator.length) / 2));
+  const splitFocus = getSplitLogFocus(shellState);
+  const apiOffset = getLogScrollOffset(shellState, "api");
+  const sasaOffset = getLogScrollOffset(shellState, "sasa");
+  const apiLogs = getServiceLogs(shellState, "api", panelHeight).map((entry) => entry.line);
+  const sasaLogs = getServiceLogs(shellState, "sasa", panelHeight).map((entry) => entry.line);
+  const maxLines = Math.max(panelHeight, apiLogs.length, sasaLogs.length);
+  const apiTitle = splitFocus === "api" ? `API* (+${apiOffset})` : `API (+${apiOffset})`;
+  const sasaTitle = splitFocus === "sasa" ? `SASA* (+${sasaOffset})` : `SASA (+${sasaOffset})`;
+
+  process.stdout.write("Logs (split: api | sasa):\n");
+  process.stdout.write(`${padCell(apiTitle, columnWidth)}${separator}${padCell(sasaTitle, columnWidth)}\n`);
+  process.stdout.write(`${"-".repeat(columnWidth)}${separator}${"-".repeat(columnWidth)}\n`);
+
+  for (let index = 0; index < maxLines; index += 1) {
+    const apiLine = apiLogs[index] ?? (index === 0 && apiLogs.length === 0 ? "(no logs yet)" : "");
+    const sasaLine = sasaLogs[index] ?? (index === 0 && sasaLogs.length === 0 ? "(no logs yet)" : "");
+    process.stdout.write(`${padCell(apiLine, columnWidth)}${separator}${padCell(sasaLine, columnWidth)}\n`);
+  }
+
+  process.stdout.write("Controls: [ focus API ] focus SASA | PgUp/PgDn scroll | Home/End latest\n");
   process.stdout.write("\n");
 }
 
@@ -109,6 +154,10 @@ function truncateLine(line: string, maxWidth: number): string {
     return line.slice(0, maxWidth);
   }
   return `${line.slice(0, maxWidth - 3)}...`;
+}
+
+function padCell(line: string, width: number): string {
+  return truncateLine(line, width).padEnd(width, " ");
 }
 
 function drawBox(lines: string[]): string {

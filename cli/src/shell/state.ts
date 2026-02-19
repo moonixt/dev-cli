@@ -18,7 +18,9 @@ export function createShellState(): ShellState {
   return {
     running: new Map<ServiceName, BackgroundService>(),
     logs: [],
-    logView: "all",
+    logView: "off",
+    logScrollOffset: { api: 0, sasa: 0 },
+    splitLogFocus: "api",
     message: ""
   };
 }
@@ -62,21 +64,79 @@ export function setLogView(shellState: ShellState, view: LogView): void {
 
 export function clearLogs(shellState: ShellState): void {
   shellState.logs = [];
+  shellState.logScrollOffset.api = 0;
+  shellState.logScrollOffset.sasa = 0;
   if (shellState.onChange) {
     shellState.onChange();
   }
 }
 
 export function getVisibleLogs(shellState: ShellState, limit: number): ServiceLogEntry[] {
-  const filtered =
-    shellState.logView === "all"
-      ? shellState.logs
-      : shellState.logs.filter((entry) => entry.service === shellState.logView);
-  if (filtered.length <= limit) {
-    return filtered;
+  if (shellState.logView === "off") {
+    return [];
   }
 
-  return filtered.slice(filtered.length - limit);
+  if (shellState.logView === "all") {
+    return sliceWithOffset(shellState.logs, limit, 0);
+  }
+
+  const filtered = shellState.logs.filter((entry) => entry.service === shellState.logView);
+  return sliceWithOffset(filtered, limit, shellState.logScrollOffset[shellState.logView]);
+}
+
+export function getServiceLogs(shellState: ShellState, serviceName: ServiceName, limit: number): ServiceLogEntry[] {
+  const filtered = shellState.logs.filter((entry) => entry.service === serviceName);
+  return sliceWithOffset(filtered, limit, shellState.logScrollOffset[serviceName]);
+}
+
+export function getSplitLogFocus(shellState: ShellState): ServiceName {
+  return shellState.splitLogFocus;
+}
+
+export function getLogScrollOffset(shellState: ShellState, serviceName: ServiceName): number {
+  return shellState.logScrollOffset[serviceName];
+}
+
+export function setSplitLogFocus(shellState: ShellState, serviceName: ServiceName): void {
+  if (shellState.splitLogFocus === serviceName) {
+    return;
+  }
+
+  shellState.splitLogFocus = serviceName;
+  if (shellState.onChange) {
+    shellState.onChange();
+  }
+}
+
+export function scrollFocusedLog(
+  shellState: ShellState,
+  delta: number,
+  visibleLines: number
+): { changed: boolean; service: ServiceName; offset: number } {
+  const targetService = shellState.logView === "sasa" ? "sasa" : shellState.logView === "api" ? "api" : shellState.splitLogFocus;
+  const changed = scrollServiceLogs(shellState, targetService, delta, visibleLines);
+  return {
+    changed,
+    service: targetService,
+    offset: shellState.logScrollOffset[targetService]
+  };
+}
+
+export function resetFocusedLogScroll(
+  shellState: ShellState
+): { changed: boolean; service: ServiceName; offset: number } {
+  const targetService = shellState.logView === "sasa" ? "sasa" : shellState.logView === "api" ? "api" : shellState.splitLogFocus;
+  const changed = shellState.logScrollOffset[targetService] !== 0;
+  shellState.logScrollOffset[targetService] = 0;
+  if (changed && shellState.onChange) {
+    shellState.onChange();
+  }
+
+  return {
+    changed,
+    service: targetService,
+    offset: shellState.logScrollOffset[targetService]
+  };
 }
 
 export function startBackground(
@@ -229,12 +289,16 @@ function attachStreamReader(
 }
 
 function addLog(shellState: ShellState, entry: ServiceLogEntry): void {
+  if (shellState.logScrollOffset[entry.service] > 0) {
+    shellState.logScrollOffset[entry.service] += 1;
+  }
+
   shellState.logs.push(entry);
   if (shellState.logs.length > maxShellLogLines) {
     shellState.logs.splice(0, shellState.logs.length - maxShellLogLines);
   }
 
-  if (shellState.onChange) {
+  if (shellState.onChange && shellState.logView !== "off") {
     shellState.onChange();
   }
 }
@@ -242,4 +306,32 @@ function addLog(shellState: ShellState, entry: ServiceLogEntry): void {
 function sanitizeLogLine(line: string): string {
   const clean = line.replace(/\r/g, "").trimEnd();
   return clean.length === 0 ? "(blank)" : clean;
+}
+
+function sliceWithOffset(entries: ServiceLogEntry[], limit: number, offset: number): ServiceLogEntry[] {
+  if (entries.length === 0 || limit <= 0) {
+    return [];
+  }
+
+  const maxOffset = Math.max(0, entries.length - limit);
+  const safeOffset = Math.min(Math.max(0, offset), maxOffset);
+  const end = entries.length - safeOffset;
+  const start = Math.max(0, end - limit);
+  return entries.slice(start, end);
+}
+
+function scrollServiceLogs(shellState: ShellState, serviceName: ServiceName, delta: number, visibleLines: number): boolean {
+  const entries = shellState.logs.filter((entry) => entry.service === serviceName);
+  const maxOffset = Math.max(0, entries.length - Math.max(1, visibleLines));
+  const current = shellState.logScrollOffset[serviceName];
+  const next = Math.min(Math.max(0, current + delta), maxOffset);
+  if (next === current) {
+    return false;
+  }
+
+  shellState.logScrollOffset[serviceName] = next;
+  if (shellState.onChange) {
+    shellState.onChange();
+  }
+  return true;
 }

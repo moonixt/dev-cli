@@ -20,7 +20,7 @@ export type ShellCommand = {
   description: string;
 };
 
-export type LogView = "all" | ServiceName;
+export type LogView = "off" | "all" | ServiceName;
 
 export type ServiceLogEntry = {
   service: ServiceName;
@@ -38,6 +38,8 @@ export type ShellState = {
   running: Map<ServiceName, BackgroundService>;
   logs: ServiceLogEntry[];
   logView: LogView;
+  logScrollOffset: Record<ServiceName, number>;
+  splitLogFocus: ServiceName;
   message: string;
   onChange?: () => void;
 };
