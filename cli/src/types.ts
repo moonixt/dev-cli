@@ -1,18 +1,21 @@
 import type { ChildProcess } from "node:child_process";
 
-export type RunTarget = "api" | "sasa" | "all";
-export type ServiceName = "api" | "sasa";
+export type RunTarget = "api" | "sasa" | "frontend" | "waha" | "all";
+export type ServiceName = "api" | "sasa" | "frontend" | "waha";
 
 export type ServiceConfig = {
   command: string;
   args: string[];
   cwd: string;
   label: string;
+  dockerContainerId?: string;
 };
 
 export type StartCommandOptions = {
   dotnet: string;
   python: string;
+  npm: string;
+  docker: string;
 };
 
 export type ShellCommand = {
@@ -30,8 +33,9 @@ export type ServiceLogEntry = {
 };
 
 export type BackgroundService = {
-  child: ChildProcess;
+  child?: ChildProcess;
   pid: number;
+  external?: boolean;
 };
 
 export type ShellState = {

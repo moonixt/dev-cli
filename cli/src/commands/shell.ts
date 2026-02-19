@@ -5,8 +5,10 @@ import { assertPathsExist, getServiceConfig } from "../services/service-config";
 import { shellCommandNames } from "../shell/commands";
 import { filterShellCommands, printShellHelp, renderLiveShell, renderShellHome } from "../shell/render";
 import {
+  attachExternalLogStreams,
   clearLogs,
   createShellState,
+  hydrateRunningServices,
   getRunningSummary,
   resetFocusedLogScroll,
   scrollFocusedLog,
@@ -21,6 +23,11 @@ import {
 import type { ServiceConfig, ServiceName, ShellState, StartCommandOptions } from "../types";
 import { normalizeTarget } from "../utils/target";
 
+const splitOrder: ServiceName[] = ["api", "sasa", "frontend", "waha"];
+const splitPageSize = 2;
+const defaultNpmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+const defaultDockerCommand = "docker";
+
 export function registerShellCommand(program: Command): void {
   program
     .command("shell", { isDefault: true })
@@ -28,8 +35,10 @@ export function registerShellCommand(program: Command): void {
     .description("Interactive terminal UI with slash commands")
     .option("--dotnet <command>", "Override dotnet executable", "dotnet")
     .option("--python <command>", "Override python executable", "python")
+    .option("--npm <command>", "Override npm executable", defaultNpmCommand)
+    .option("--docker <command>", "Override docker executable", defaultDockerCommand)
     .action(async (options: StartCommandOptions) => {
-      const services = getServiceConfig(options.dotnet, options.python);
+      const services = getServiceConfig(options.dotnet, options.python, options.npm, options.docker);
       assertPathsExist(services);
       process.exitCode = await runShell(services);
     });
@@ -37,6 +46,13 @@ export function registerShellCommand(program: Command): void {
 
 async function runShell(services: Record<ServiceName, ServiceConfig>): Promise<number> {
   const shellState = createShellState();
+  hydrateRunningServices(shellState, services);
+  const externalServices = Array.from(shellState.running.entries())
+    .filter(([, running]) => running.external)
+    .map(([serviceName]) => serviceName);
+  if (externalServices.length > 0) {
+    setShellMessage(shellState, `detected running services: ${externalServices.join(", ")}`);
+  }
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     return runShellFallback(services, shellState);
   }
@@ -63,7 +79,7 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
         return;
       }
 
-      stopAllRunning(shellState);
+      stopAllRunning(shellState, services);
 
       closed = true;
       stdin.off("keypress", onKeypress);
@@ -133,11 +149,11 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
 
       if (shellState.logView === "all" && input.length === 0) {
         if (str === "[") {
-          setSplitLogFocus(shellState, "api");
+          setSplitLogFocus(shellState, previousSplitFocus(shellState.splitLogFocus));
           return true;
         }
         if (str === "]") {
-          setSplitLogFocus(shellState, "sasa");
+          setSplitLogFocus(shellState, nextSplitFocus(shellState.splitLogFocus));
           return true;
         }
       }
@@ -284,7 +300,7 @@ function runShellFallback(services: Record<ServiceName, ServiceConfig>, shellSta
       }
       closing = true;
       lastExitCode = 130;
-      stopAllRunning(shellState);
+      stopAllRunning(shellState, services);
       rl.close();
     };
 
@@ -326,7 +342,7 @@ function runShellFallback(services: Record<ServiceName, ServiceConfig>, shellSta
     rl.on("close", () => {
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
-      stopAllRunning(shellState);
+      stopAllRunning(shellState, services);
       resolve(lastExitCode);
     });
   });
@@ -378,6 +394,7 @@ async function handleShellInput(
 
   if (input === "/logs" || input === "logs") {
     setLogView(shellState, "all");
+    attachExternalLogStreams(shellState, services, splitOrder);
     setShellMessage(shellState, "log view set to all");
     return { continueShell: true, exitCode: 0 };
   }
@@ -388,9 +405,14 @@ async function handleShellInput(
     return { continueShell: true, exitCode: 0 };
   }
 
-  if (input === "/logs all" || input === "/logs api" || input === "/logs sasa") {
-    const view = (input.split(/\s+/)[1] ?? "all") as "all" | "api" | "sasa";
+  if (input === "/logs all" || input === "/logs api" || input === "/logs sasa" || input === "/logs frontend" || input === "/logs waha") {
+    const view = (input.split(/\s+/)[1] ?? "all") as "all" | "api" | "sasa" | "frontend" | "waha";
     setLogView(shellState, view);
+    if (view === "all") {
+      attachExternalLogStreams(shellState, services, splitOrder);
+    } else {
+      attachExternalLogStreams(shellState, services, [view]);
+    }
     setShellMessage(shellState, `log view set to ${view}`);
     return { continueShell: true, exitCode: 0 };
   }
@@ -415,9 +437,28 @@ async function handleShellInput(
   if (normalized.startsWith("/stop")) {
     const parts = normalized.split(/\s+/).filter(Boolean);
     const target = normalizeTarget(parts[1] ?? "all");
-    return { continueShell: true, exitCode: stopBackground(target, shellState) };
+    return { continueShell: true, exitCode: stopBackground(target, services, shellState) };
   }
 
   writeShellOutput(shellState, `Unknown command: ${input}`);
   return { continueShell: true, exitCode: 1 };
+}
+
+function nextSplitFocus(current: ServiceName): ServiceName {
+  return shiftSplitFocusByPage(current, 1);
+}
+
+function previousSplitFocus(current: ServiceName): ServiceName {
+  return shiftSplitFocusByPage(current, -1);
+}
+
+function shiftSplitFocusByPage(current: ServiceName, direction: 1 | -1): ServiceName {
+  const pageCount = Math.ceil(splitOrder.length / splitPageSize);
+  const currentIndex = splitOrder.indexOf(current);
+  const safeIndex = currentIndex >= 0 ? currentIndex : 0;
+  const currentPage = Math.floor(safeIndex / splitPageSize);
+  const columnOffset = safeIndex % splitPageSize;
+  const nextPage = (currentPage + direction + pageCount) % pageCount;
+  const nextIndex = Math.min(nextPage * splitPageSize + columnOffset, splitOrder.length - 1);
+  return splitOrder[nextIndex];
 }

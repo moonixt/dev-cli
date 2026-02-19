@@ -9,7 +9,11 @@ import {
   getVisibleLogs,
   isSuggestionRunning
 } from "./state";
-import type { ShellCommand, ShellState } from "../types";
+import type { ServiceName, ShellCommand, ShellState } from "../types";
+
+const splitServices: ServiceName[] = ["api", "sasa", "frontend", "waha"];
+const splitPageSize = 2;
+const ansiSgrPattern = /\u001b\[[0-9;?]*[ -/]*m/g;
 
 export function printShellHelp(): void {
   const maxCommandLength = shellCommands.reduce((max, item) => Math.max(max, item.command.length), 0);
@@ -42,7 +46,7 @@ export function renderLiveShell(input: string, selectedIndex: number, shellState
     const suggestion = suggestions[index];
     const marker = index === activeIndex ? ">" : " ";
     const isRunning = isSuggestionRunning(suggestion.command, shellState);
-    const paddedCommand = suggestion.command.padEnd(12, " ");
+    const paddedCommand = suggestion.command.padEnd(16, " ");
     const commandText = isRunning ? colorRed(paddedCommand) : paddedCommand;
     const descriptionText = isRunning ? `${suggestion.description} ${colorRed("running")}` : suggestion.description;
     process.stdout.write(`${marker} ${commandText} ${descriptionText}\n`);
@@ -116,48 +120,70 @@ function renderSplitLogPanel(shellState: ShellState): void {
   const panelHeight = getLogPanelHeight();
   const width = Math.max(60, (process.stdout.columns ?? 120) - 2);
   const separator = " | ";
-  const columnWidth = Math.max(24, Math.floor((width - separator.length) / 2));
   const splitFocus = getSplitLogFocus(shellState);
-  const apiOffset = getLogScrollOffset(shellState, "api");
-  const sasaOffset = getLogScrollOffset(shellState, "sasa");
-  const apiLogs = getServiceLogs(shellState, "api", panelHeight).map((entry) => entry.line);
-  const sasaLogs = getServiceLogs(shellState, "sasa", panelHeight).map((entry) => entry.line);
-  const maxLines = Math.max(panelHeight, apiLogs.length, sasaLogs.length);
-  const apiTitle = splitFocus === "api" ? `API* (+${apiOffset})` : `API (+${apiOffset})`;
-  const sasaTitle = splitFocus === "sasa" ? `SASA* (+${sasaOffset})` : `SASA (+${sasaOffset})`;
+  const visibleServices = resolveVisibleSplitServices(splitFocus);
+  const separatorWidth = separator.length * (visibleServices.length - 1);
+  const columnWidth = Math.max(18, Math.floor((width - separatorWidth) / visibleServices.length));
 
-  process.stdout.write("Logs (split: api | sasa):\n");
-  process.stdout.write(`${padCell(apiTitle, columnWidth)}${separator}${padCell(sasaTitle, columnWidth)}\n`);
-  process.stdout.write(`${"-".repeat(columnWidth)}${separator}${"-".repeat(columnWidth)}\n`);
+  const serviceLogs = visibleServices.map((serviceName) => ({
+    serviceName,
+    offset: getLogScrollOffset(shellState, serviceName),
+    lines: getServiceLogs(shellState, serviceName, panelHeight).map((entry) => entry.line)
+  }));
+  const maxLines = Math.max(
+    panelHeight,
+    ...serviceLogs.map((item) => item.lines.length)
+  );
+  const titles = serviceLogs.map((item) => {
+    const serviceLabel = item.serviceName.toUpperCase();
+    return splitFocus === item.serviceName
+      ? `${serviceLabel}* (+${item.offset})`
+      : `${serviceLabel} (+${item.offset})`;
+  });
+  const titleRow = titles.map((title) => padCell(title, columnWidth)).join(separator);
+  const dividerRow = visibleServices.map(() => "-".repeat(columnWidth)).join(separator);
+
+  const showingLabel = visibleServices.join(" | ");
+  const fullLabel = splitServices.join(" | ");
+  const pageIndex = Math.floor(Math.max(0, splitServices.indexOf(splitFocus)) / splitPageSize);
+  const pageCount = Math.ceil(splitServices.length / splitPageSize);
+  process.stdout.write(`Logs (split: ${showingLabel}) [page ${pageIndex + 1}/${pageCount} | all: ${fullLabel}]:\n`);
+  process.stdout.write(`${titleRow}\n`);
+  process.stdout.write(`${dividerRow}\n`);
 
   for (let index = 0; index < maxLines; index += 1) {
-    const apiLine = apiLogs[index] ?? (index === 0 && apiLogs.length === 0 ? "(no logs yet)" : "");
-    const sasaLine = sasaLogs[index] ?? (index === 0 && sasaLogs.length === 0 ? "(no logs yet)" : "");
-    process.stdout.write(`${padCell(apiLine, columnWidth)}${separator}${padCell(sasaLine, columnWidth)}\n`);
+    const row = serviceLogs
+      .map((item) => item.lines[index] ?? (index === 0 && item.lines.length === 0 ? "(no logs yet)" : ""))
+      .map((line) => padCell(line, columnWidth))
+      .join(separator);
+    process.stdout.write(`${row}\n`);
   }
 
-  process.stdout.write("Controls: [ focus API ] focus SASA | PgUp/PgDn scroll | Home/End latest\n");
+  process.stdout.write("Controls: [ prev pair | ] next pair | PgUp/PgDn scroll | Home/End latest\n");
   process.stdout.write("\n");
 }
 
 function getLogPanelHeight(): number {
   const rows = process.stdout.rows ?? 40;
-  // Reserve space for header, input and suggestions.
-  return Math.max(6, Math.min(18, rows - 20));
+  // Reserve less space for chrome so logs stay readable.
+  return Math.max(8, Math.min(24, rows - 14));
 }
 
 function truncateLine(line: string, maxWidth: number): string {
-  if (line.length <= maxWidth) {
+  if (visibleLength(line) <= maxWidth) {
     return line;
   }
   if (maxWidth <= 3) {
-    return line.slice(0, maxWidth);
+    return sliceAnsiByVisibleWidth(line, maxWidth);
   }
-  return `${line.slice(0, maxWidth - 3)}...`;
+  const truncated = sliceAnsiByVisibleWidth(line, maxWidth - 3);
+  return line.includes("\u001b[") ? `${truncated}...${ansiReset}` : `${truncated}...`;
 }
 
 function padCell(line: string, width: number): string {
-  return truncateLine(line, width).padEnd(width, " ");
+  const truncated = truncateLine(line, width);
+  const padding = Math.max(0, width - visibleLength(truncated));
+  return `${truncated}${" ".repeat(padding)}`;
 }
 
 function drawBox(lines: string[]): string {
@@ -173,4 +199,45 @@ function colorRed(text: string): string {
   }
 
   return `${ansiRed}${text}${ansiReset}`;
+}
+
+function resolveVisibleSplitServices(splitFocus: ServiceName): ServiceName[] {
+  const focusIndex = Math.max(0, splitServices.indexOf(splitFocus));
+  const startIndex = Math.floor(focusIndex / splitPageSize) * splitPageSize;
+  const visible = splitServices.slice(startIndex, startIndex + splitPageSize);
+  return visible.length > 0 ? visible : splitServices.slice(0, splitPageSize);
+}
+
+function visibleLength(line: string): number {
+  return line.replace(ansiSgrPattern, "").length;
+}
+
+function sliceAnsiByVisibleWidth(line: string, maxWidth: number): string {
+  if (maxWidth <= 0) {
+    return "";
+  }
+
+  let index = 0;
+  let visibleCount = 0;
+  let result = "";
+
+  while (index < line.length && visibleCount < maxWidth) {
+    if (line[index] === "\u001b") {
+      const match = line.slice(index).match(/^\u001b\[[0-9;?]*[ -/]*m/);
+      if (match) {
+        result += match[0];
+        index += match[0].length;
+        continue;
+      }
+
+      index += 1;
+      continue;
+    }
+
+    result += line[index];
+    index += 1;
+    visibleCount += 1;
+  }
+
+  return result;
 }
