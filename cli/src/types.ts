@@ -18,7 +18,10 @@ export type StartCommandOptions = {
   docker: string;
 };
 
+export type ShellCommandCategory = "api" | "logs" | "database" | "keywords" | "system";
+
 export type ShellCommand = {
+  category: ShellCommandCategory;
   command: string;
   description: string;
 };
@@ -30,6 +33,16 @@ export type ServiceLogEntry = {
   stream: "stdout" | "stderr";
   line: string;
   timestamp: number;
+};
+
+export type ServiceLogLevel = "info" | "warn" | "error";
+
+export type PersistedLogEntry = {
+  ts: string;
+  service: ServiceName;
+  stream: "stdout" | "stderr";
+  level: ServiceLogLevel;
+  msg: string;
 };
 
 export type BackgroundService = {

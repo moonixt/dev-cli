@@ -1,9 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { logPrefix } from "../config";
+import { bold, cyan, highlightErrorKeywords } from "./colors";
 
 type RunCommandOptions = {
   silent?: boolean;
 };
+const errorTag = bold(cyan(logPrefix, process.stderr), process.stderr);
 
 export function runCommand(command: string, args: string[], cwd: string, options?: RunCommandOptions): Promise<number> {
   return new Promise((resolve) => {
@@ -15,7 +17,9 @@ export function runCommand(command: string, args: string[], cwd: string, options
     });
 
     child.on("error", (error) => {
-      console.error(`${logPrefix} failed to start ${command}: ${error.message}`);
+      console.error(
+        `${errorTag} ${highlightErrorKeywords(`failed to start ${command}: ${error.message}`, process.stderr)}`
+      );
       resolve(1);
     });
 

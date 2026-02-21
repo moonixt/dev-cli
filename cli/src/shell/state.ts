@@ -12,6 +12,7 @@ import type {
   ShellState
 } from "../types";
 import { terminateProcess } from "../utils/process";
+import { appendServiceLogLine } from "../utils/service-log-file";
 
 const maxShellLogLines = 1000;
 const serviceOrder: ServiceName[] = ["api", "sasa", "frontend", "waha"];
@@ -418,6 +419,8 @@ function attachStreamReader(
 }
 
 function addLog(shellState: ShellState, entry: ServiceLogEntry): void {
+  appendServiceLogLine(entry);
+
   if (shellState.logScrollOffset[entry.service] > 0) {
     shellState.logScrollOffset[entry.service] += 1;
   }

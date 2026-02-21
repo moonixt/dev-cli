@@ -1,13 +1,22 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { Command } from "commander";
+import type { Readable } from "node:stream";
 import { logPrefix } from "../../config";
 import { assertPathsExist, getServiceConfig } from "../../services/service-config";
 import type { RunTarget, ServiceConfig, ServiceName, StartCommandOptions } from "../../types";
+import { bold, colorService, cyan, green, red, yellow } from "../../utils/colors";
 import { terminateProcess } from "../../utils/process";
+import {
+  appendServiceLogLine,
+  getLegacyConsolidatedLogPath,
+  getServiceLogsRootPath
+} from "../../utils/service-log-file";
 import { normalizeTarget } from "../../utils/target";
 
 const defaultNpmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const defaultDockerCommand = "docker";
+const logTag = bold(cyan(logPrefix));
+const errorTag = bold(cyan(logPrefix, process.stderr), process.stderr);
 
 export function registerStartCommand(program: Command): void {
   program
@@ -41,7 +50,12 @@ export async function executeStart(
 
 function runSingle(name: ServiceName, service: ServiceConfig): Promise<number> {
   return new Promise((resolve) => {
-    console.log(`${logPrefix} Starting ${service.label} in ${service.cwd}`);
+    console.log(
+      `${logTag} ${green("Starting")} ${colorService(name, service.label)} ${yellow("in")} ${service.cwd}`
+    );
+    console.log(
+      `${logTag} ${yellow("Writing logs to")} ${getServiceLogsRootPath()} ${yellow("| consolidated:")} ${getLegacyConsolidatedLogPath()}`
+    );
     const child = spawnProcess(service, name);
     if (!child) {
       resolve(1);
@@ -50,7 +64,9 @@ function runSingle(name: ServiceName, service: ServiceConfig): Promise<number> {
 
     child.on("exit", (code, signal) => {
       if (signal) {
-        console.error(`${logPrefix} ${service.label} exited from signal ${signal}`);
+        console.error(
+          `${errorTag} ${colorService(name, service.label, process.stderr)} ${red(`exited from signal ${signal}`, process.stderr)}`
+        );
         resolve(1);
         return;
       }
@@ -62,7 +78,11 @@ function runSingle(name: ServiceName, service: ServiceConfig): Promise<number> {
 function runAll(services: Record<ServiceName, ServiceConfig>): Promise<number> {
   return new Promise((resolve) => {
     const targets: ServiceName[] = ["api", "sasa", "frontend", "waha"];
-    console.log(`${logPrefix} Starting API, SASA, FRONTEND and WAHA`);
+    const serviceLabels = targets.map((serviceName) => colorService(serviceName, serviceName.toUpperCase())).join(", ");
+    console.log(`${logTag} ${green("Starting")} ${serviceLabels}`);
+    console.log(
+      `${logTag} ${yellow("Writing logs to")} ${getServiceLogsRootPath()} ${yellow("| consolidated:")} ${getLegacyConsolidatedLogPath()}`
+    );
     const childrenByService = new Map<ServiceName, ChildProcess>();
     let finalCode = 0;
     for (const serviceName of targets) {
@@ -96,7 +116,7 @@ function runAll(services: Record<ServiceName, ServiceConfig>): Promise<number> {
     };
 
     const onSignal = (signal: NodeJS.Signals): void => {
-      console.log(`${logPrefix} Received ${signal}, stopping services`);
+      console.log(`${logTag} ${yellow(`Received ${signal}, stopping services`)}`);
       stopAll();
       resolveOnce(0);
     };
@@ -108,10 +128,14 @@ function runAll(services: Record<ServiceName, ServiceConfig>): Promise<number> {
       finished += 1;
 
       if (signal) {
-        console.error(`${logPrefix} ${serviceName} exited from signal ${signal}`);
+        console.error(
+          `${errorTag} ${colorService(serviceName, serviceName.toUpperCase(), process.stderr)} ${red(`exited from signal ${signal}`, process.stderr)}`
+        );
         finalCode = finalCode || 1;
       } else if ((code ?? 1) !== 0) {
-        console.error(`${logPrefix} ${serviceName} exited with code ${code}`);
+        console.error(
+          `${errorTag} ${colorService(serviceName, serviceName.toUpperCase(), process.stderr)} ${red(`exited with code ${code}`, process.stderr)}`
+        );
         finalCode = finalCode || (code ?? 1);
         stopAll();
       }
@@ -136,7 +160,9 @@ function spawnProcess(service: ServiceConfig, serviceName: ServiceName): ChildPr
   if (service.dockerContainerId) {
     const ensureRunning = ensureDockerContainerRunning(service);
     if (!ensureRunning.ok) {
-      console.error(`${logPrefix} Failed to start ${serviceName} container: ${ensureRunning.message}`);
+      console.error(
+        `${errorTag} ${red("Failed to start")} ${colorService(serviceName, `${serviceName.toUpperCase()} container`, process.stderr)}: ${red(ensureRunning.message, process.stderr)}`
+      );
       return null;
     }
   }
@@ -145,20 +171,86 @@ function spawnProcess(service: ServiceConfig, serviceName: ServiceName): ChildPr
   try {
     child = spawn(service.command, service.args, {
       cwd: service.cwd,
-      stdio: "inherit",
+      stdio: ["inherit", "pipe", "pipe"],
       env: process.env
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`${logPrefix} Failed to start ${serviceName}: ${message}`);
+    console.error(
+      `${errorTag} ${red("Failed to start", process.stderr)} ${colorService(serviceName, serviceName.toUpperCase(), process.stderr)}: ${red(message, process.stderr)}`
+    );
     return null;
   }
 
   child.on("error", (error) => {
-    console.error(`${logPrefix} Failed to start ${serviceName}: ${error.message}`);
+    console.error(
+      `${errorTag} ${red("Failed to start", process.stderr)} ${colorService(serviceName, serviceName.toUpperCase(), process.stderr)}: ${red(error.message, process.stderr)}`
+    );
   });
 
+  attachProcessLogForwarding(child, serviceName);
+
   return child;
+}
+
+function attachProcessLogForwarding(child: ChildProcess, serviceName: ServiceName): void {
+  if (child.stdout) {
+    forwardStreamToConsoleAndFile(child.stdout, process.stdout, serviceName, "stdout");
+  }
+
+  if (child.stderr) {
+    forwardStreamToConsoleAndFile(child.stderr, process.stderr, serviceName, "stderr");
+  }
+}
+
+function forwardStreamToConsoleAndFile(
+  stream: Readable,
+  output: NodeJS.WriteStream,
+  serviceName: ServiceName,
+  streamType: "stdout" | "stderr"
+): void {
+  let buffered = "";
+  stream.on("data", (chunk: Buffer | string) => {
+    output.write(chunk);
+    buffered += chunk.toString();
+    const lines = buffered.split(/\r?\n/);
+    buffered = lines.pop() ?? "";
+    for (const line of lines) {
+      appendServiceLogLine({
+        service: serviceName,
+        stream: streamType,
+        line: sanitizeLogLine(line),
+        timestamp: Date.now()
+      });
+    }
+  });
+
+  stream.on("end", () => {
+    if (buffered.length === 0) {
+      return;
+    }
+
+    appendServiceLogLine({
+      service: serviceName,
+      stream: streamType,
+      line: sanitizeLogLine(buffered),
+      timestamp: Date.now()
+    });
+    buffered = "";
+  });
+}
+
+function sanitizeLogLine(line: string): string {
+  const clean = line
+    .replace(/\r/g, "")
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, (sequence) => (sequence.endsWith("m") ? sequence : ""))
+    .replace(/\u001b(?!\[[0-9;?]*[ -/]*m)/g, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+    .trimEnd();
+
+  const visible = clean.replace(/\u001b\[[0-9;?]*[ -/]*m/g, "").trim();
+  return visible.length === 0 ? "(blank)" : clean;
 }
 
 function ensureDockerContainerRunning(service: ServiceConfig): { ok: boolean; message: string } {

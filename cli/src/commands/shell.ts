@@ -21,6 +21,16 @@ import {
   writeShellOutput
 } from "../shell/state";
 import type { ServiceConfig, ServiceName, ShellState, StartCommandOptions } from "../types";
+import {
+  addErrorKeyword,
+  getErrorKeywords,
+  getErrorKeywordsConfigPath,
+  hasPersistedErrorKeywords,
+  removeErrorKeyword,
+  resetErrorKeywords,
+  setErrorKeywords
+} from "../utils/error-keywords";
+import { getLegacyConsolidatedLogPath, getServiceLogsRootPath } from "../utils/service-log-file";
 import { normalizeTarget } from "../utils/target";
 
 const splitOrder: ServiceName[] = ["api", "sasa", "frontend", "waha"];
@@ -46,12 +56,19 @@ export function registerShellCommand(program: Command): void {
 
 async function runShell(services: Record<ServiceName, ServiceConfig>): Promise<number> {
   const shellState = createShellState();
+  setShellMessage(
+    shellState,
+    `service logs dir: ${getServiceLogsRootPath()} | consolidated: ${getLegacyConsolidatedLogPath()}`
+  );
   hydrateRunningServices(shellState, services);
   const externalServices = Array.from(shellState.running.entries())
     .filter(([, running]) => running.external)
     .map(([serviceName]) => serviceName);
   if (externalServices.length > 0) {
-    setShellMessage(shellState, `detected running services: ${externalServices.join(", ")}`);
+    setShellMessage(
+      shellState,
+      `detected running services: ${externalServices.join(", ")} | logs: ${getServiceLogsRootPath()}`
+    );
   }
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     return runShellFallback(services, shellState);
@@ -349,7 +366,7 @@ function runShellFallback(services: Record<ServiceName, ServiceConfig>, shellSta
 }
 
 function shellCompleter(input: string): [string[], string] {
-  const trimmed = input.trim();
+  const trimmed = normalizeShellPrefix(input.trim());
   const matches = shellCommandNames.filter((command) => command.startsWith(trimmed));
   if (matches.length > 0) {
     return [matches, input];
@@ -368,7 +385,7 @@ async function handleShellInput(
 
   if (input === "/" || input === "/help" || input === "help") {
     if (shellState.onChange) {
-      setShellMessage(shellState, "Use /start, /stop, /logs, /status, /clear, /db reset, /exit");
+      setShellMessage(shellState, "Use /start, /stop, /logs, /db, /keywords, /status, /clear, /exit");
     } else {
       printShellHelp();
     }
@@ -421,7 +438,11 @@ async function handleShellInput(
     return { continueShell: false, exitCode: 0 };
   }
 
-  const normalized = input.startsWith("/") ? input : `/${input}`;
+  const normalized = normalizeShellPrefix(input.startsWith("/") ? input : `/${input}`);
+  if (normalized.startsWith("/keywords")) {
+    return { continueShell: true, exitCode: handleKeywordShellCommand(normalized, shellState) };
+  }
+
   if (normalized.startsWith("/start") || normalized.startsWith("/run")) {
     const parts = normalized.split(/\s+/).filter(Boolean);
     const target = normalizeTarget(parts[1] ?? "all");
@@ -442,6 +463,152 @@ async function handleShellInput(
 
   writeShellOutput(shellState, `Unknown command: ${input}`);
   return { continueShell: true, exitCode: 1 };
+}
+
+function normalizeShellPrefix(input: string): string {
+  if (input === "/keyword") {
+    return "/keywords";
+  }
+
+  if (input.startsWith("/keyword ")) {
+    return `/keywords ${input.slice(9)}`.trimEnd();
+  }
+
+  if (input === "/kw") {
+    return "/keywords";
+  }
+
+  if (input.startsWith("/kw ")) {
+    return `/keywords ${input.slice(4)}`.trimEnd();
+  }
+
+  return input;
+}
+
+function handleKeywordShellCommand(input: string, shellState: ShellState): number {
+  const tokens = parseShellTokens(input);
+  const actionToken = (tokens[1] ?? "list").toLowerCase();
+  const knownActions = new Set(["list", "add", "remove", "set", "reset"]);
+  const hasExplicitAction = knownActions.has(actionToken);
+  const action = hasExplicitAction ? actionToken : (tokens.length > 1 ? "add" : "list");
+
+  if (action === "list") {
+    const list = getErrorKeywords();
+    const configState = hasPersistedErrorKeywords() ? "persisted" : "defaults/env";
+    writeShellOutput(shellState, `keywords (${configState}): ${formatKeywords(list)}`);
+    writeShellOutput(shellState, `config: ${getErrorKeywordsConfigPath()}`);
+    setShellMessage(shellState, "keywords listed");
+    return 0;
+  }
+
+  if (action === "reset") {
+    const updated = resetErrorKeywords();
+    writeShellOutput(shellState, `keywords reset: ${formatKeywords(updated)}`);
+    setShellMessage(shellState, "keywords reset");
+    return 0;
+  }
+
+  if (action === "add") {
+    let rawKeyword = hasExplicitAction
+      ? input.replace(/^\/keywords\s+add\s*/i, "").trim()
+      : tokens.slice(1).join(" ").trim();
+    const keyword = stripMatchingQuotes(rawKeyword);
+    if (!keyword) {
+      writeShellOutput(shellState, "Usage: /keywords add <keyword>");
+      return 1;
+    }
+
+    try {
+      const result = addErrorKeyword(keyword);
+      if (!result.added) {
+        writeShellOutput(shellState, `keyword already exists: ${result.keyword}`);
+        setShellMessage(shellState, "keyword unchanged");
+        return 0;
+      }
+
+      writeShellOutput(shellState, `keyword added: ${result.keyword}`);
+      writeShellOutput(shellState, `keywords: ${formatKeywords(result.updatedKeywords)}`);
+      setShellMessage(shellState, "keyword added");
+      return 0;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      writeShellOutput(shellState, `keywords add failed: ${message}`);
+      return 1;
+    }
+  }
+
+  if (action === "remove") {
+    let rawKeyword = input.replace(/^\/keywords\s+remove\s*/i, "").trim();
+    const keyword = stripMatchingQuotes(rawKeyword);
+    if (!keyword) {
+      writeShellOutput(shellState, "Usage: /keywords remove <keyword>");
+      return 1;
+    }
+
+    try {
+      const result = removeErrorKeyword(keyword);
+      if (!result.removed) {
+        writeShellOutput(shellState, `keyword not found: ${result.keyword}`);
+        setShellMessage(shellState, "keyword not found");
+        return 0;
+      }
+
+      writeShellOutput(shellState, `keyword removed: ${result.keyword}`);
+      writeShellOutput(shellState, `keywords: ${formatKeywords(result.updatedKeywords)}`);
+      setShellMessage(shellState, "keyword removed");
+      return 0;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      writeShellOutput(shellState, `keywords remove failed: ${message}`);
+      return 1;
+    }
+  }
+
+  if (action === "set") {
+    const values = tokens.slice(2);
+    if (values.length === 0) {
+      writeShellOutput(shellState, 'Usage: /keywords set fail error panic "timed out"');
+      return 1;
+    }
+
+    try {
+      const updated = setErrorKeywords(values);
+      writeShellOutput(shellState, `keywords replaced: ${formatKeywords(updated)}`);
+      setShellMessage(shellState, "keywords replaced");
+      return 0;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      writeShellOutput(shellState, `keywords set failed: ${message}`);
+      return 1;
+    }
+  }
+
+  writeShellOutput(shellState, "Unknown keywords command. Use: /keywords list|add|remove|set|reset");
+  return 1;
+}
+
+function parseShellTokens(input: string): string[] {
+  const tokens: string[] = [];
+  const regex = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let match: RegExpExecArray | null = regex.exec(input);
+  while (match) {
+    tokens.push((match[1] ?? match[2] ?? match[3] ?? "").trim());
+    match = regex.exec(input);
+  }
+  return tokens.filter((token) => token.length > 0);
+}
+
+function stripMatchingQuotes(text: string): string {
+  if (text.length >= 2) {
+    if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+      return text.slice(1, -1).trim();
+    }
+  }
+  return text;
+}
+
+function formatKeywords(keywords: string[]): string {
+  return keywords.length > 0 ? keywords.join(", ") : "(none)";
 }
 
 function nextSplitFocus(current: ServiceName): ServiceName {

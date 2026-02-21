@@ -1,6 +1,6 @@
 import readline from "node:readline";
-import { ansiRed, ansiReset, cliVersion, repoRoot } from "../config";
-import { shellCommands } from "./commands";
+import { cliVersion, repoRoot } from "../config";
+import { shellCategoryLabels, shellCategoryOrder, shellCommands } from "./commands";
 import {
   getLogScrollOffset,
   getRunningSummary,
@@ -9,19 +9,40 @@ import {
   getVisibleLogs,
   isSuggestionRunning
 } from "./state";
-import type { ServiceName, ShellCommand, ShellState } from "../types";
+import type { ServiceName, ShellCommand, ShellCommandCategory, ShellState } from "../types";
+import {
+  bold,
+  colorService,
+  cyan,
+  dim,
+  getAnsiReset,
+  green,
+  hasAnsi,
+  highlightErrorKeywords,
+  stripAnsi,
+  yellow
+} from "../utils/colors";
 
 const splitServices: ServiceName[] = ["api", "sasa", "frontend", "waha"];
 const splitPageSize = 2;
-const ansiSgrPattern = /\u001b\[[0-9;?]*[ -/]*m/g;
 
 export function printShellHelp(): void {
   const maxCommandLength = shellCommands.reduce((max, item) => Math.max(max, item.command.length), 0);
-  const lines = shellCommands.map((item) => {
-    const paddedCommand = item.command.padEnd(maxCommandLength, " ");
-    return `${paddedCommand}  ${item.description}`;
-  });
-  process.stdout.write(`${lines.join("\n")}\n`);
+  const lines: string[] = [];
+  for (const category of shellCategoryOrder) {
+    const commandsByCategory = shellCommands.filter((item) => item.category === category);
+    if (commandsByCategory.length === 0) {
+      continue;
+    }
+
+    lines.push(colorCategoryLabel(category));
+    for (const item of commandsByCategory) {
+      const paddedCommand = item.command.padEnd(maxCommandLength, " ");
+      lines.push(`  ${cyan(paddedCommand)}  ${dim(item.description)}`);
+    }
+    lines.push("");
+  }
+  process.stdout.write(`${lines.join("\n").trimEnd()}\n`);
 }
 
 export function renderShellHome(shellState: ShellState): void {
@@ -41,23 +62,14 @@ export function renderLiveShell(input: string, selectedIndex: number, shellState
   }
 
   const activeIndex = Math.max(0, Math.min(selectedIndex, suggestions.length - 1));
-  process.stdout.write("\n");
-  for (let index = 0; index < suggestions.length; index += 1) {
-    const suggestion = suggestions[index];
-    const marker = index === activeIndex ? ">" : " ";
-    const isRunning = isSuggestionRunning(suggestion.command, shellState);
-    const paddedCommand = suggestion.command.padEnd(16, " ");
-    const commandText = isRunning ? colorRed(paddedCommand) : paddedCommand;
-    const descriptionText = isRunning ? `${suggestion.description} ${colorRed("running")}` : suggestion.description;
-    process.stdout.write(`${marker} ${commandText} ${descriptionText}\n`);
-  }
+  const renderedSuggestionLines = renderSuggestions(input, activeIndex, suggestions, shellState);
 
-  readline.moveCursor(process.stdout, 0, -(suggestions.length + 1));
+  readline.moveCursor(process.stdout, 0, -(renderedSuggestionLines + 1));
   readline.cursorTo(process.stdout, input.length + 2);
 }
 
 export function filterShellCommands(input: string): ShellCommand[] {
-  const normalized = input.trim().toLowerCase();
+  const normalized = normalizeCommandPrefix(input.trim().toLowerCase());
   if (!normalized.startsWith("/")) {
     return [];
   }
@@ -69,21 +81,88 @@ export function filterShellCommands(input: string): ShellCommand[] {
   return shellCommands.filter((item) => item.command.startsWith(normalized));
 }
 
+function renderSuggestions(
+  input: string,
+  activeIndex: number,
+  suggestions: ShellCommand[],
+  shellState: ShellState
+): number {
+  const showingAllCommands = normalizeCommandPrefix(input.trim().toLowerCase()) === "/";
+  if (!showingAllCommands) {
+    process.stdout.write("\n");
+    for (let index = 0; index < suggestions.length; index += 1) {
+      const suggestion = suggestions[index];
+      process.stdout.write(renderSuggestionLine(suggestion, index === activeIndex, shellState));
+    }
+    return suggestions.length + 1;
+  }
+
+  let renderedLines = 1;
+  let index = 0;
+  process.stdout.write("\n");
+  for (const category of shellCategoryOrder) {
+    const byCategory = suggestions.filter((item) => item.category === category);
+    if (byCategory.length === 0) {
+      continue;
+    }
+
+    process.stdout.write(`${colorCategoryLabel(category)}\n`);
+    renderedLines += 1;
+    for (const suggestion of byCategory) {
+      process.stdout.write(renderSuggestionLine(suggestion, index === activeIndex, shellState));
+      index += 1;
+      renderedLines += 1;
+    }
+  }
+
+  return renderedLines;
+}
+
+function renderSuggestionLine(suggestion: ShellCommand, isActive: boolean, shellState: ShellState): string {
+  const marker = isActive ? green(">") : " ";
+  const isRunning = isSuggestionRunning(suggestion.command, shellState);
+  const paddedCommand = suggestion.command.padEnd(18, " ");
+  const commandText = isRunning ? yellow(paddedCommand) : cyan(paddedCommand);
+  const categoryText = dim(`[${shellCategoryLabels[suggestion.category]}]`);
+  const descriptionText = isRunning ? `${suggestion.description} ${yellow("running")}` : suggestion.description;
+  return `${marker} ${categoryText} ${commandText} ${descriptionText}\n`;
+}
+
+function normalizeCommandPrefix(input: string): string {
+  if (input === "/keyword") {
+    return "/keywords";
+  }
+
+  if (input.startsWith("/keyword ")) {
+    return `/keywords ${input.slice(9)}`.trimEnd();
+  }
+
+  if (input === "/kw") {
+    return "/keywords";
+  }
+
+  if (input.startsWith("/kw ")) {
+    return `/keywords ${input.slice(4)}`.trimEnd();
+  }
+
+  return input;
+}
+
 function printShellHeader(shellState: ShellState): void {
   const lines = [
-    `> dev-cli (${cliVersion})`,
-    `workspace: ${repoRoot}`,
-    `directory: ${process.cwd()}`,
-    `running: ${getRunningSummary(shellState)}`,
-    `log view: ${shellState.logView}`,
-    "type / to list commands"
+    `> ${bold(cyan("dev-cli"))} ${dim(`(${cliVersion})`)}`,
+    `${bold("workspace:")} ${repoRoot}`,
+    `${bold("directory:")} ${process.cwd()}`,
+    `${bold("running:")} ${getRunningSummary(shellState)}`,
+    `${bold("log view:")} ${shellState.logView}`,
+    dim("type / to list commands")
   ];
 
   console.log(drawBox(lines));
   console.log("");
-  console.log("Tip: type / and use Up/Down arrows to select commands.");
+  console.log(dim("Tip: type / and use Up/Down arrows to select commands."));
   if (shellState.message) {
-    console.log(`Info: ${shellState.message}`);
+    console.log(`${yellow("Info:")} ${shellState.message}`);
   }
   console.log("");
 }
@@ -102,15 +181,15 @@ function renderLogPanel(shellState: ShellState): void {
   const width = Math.max(60, (process.stdout.columns ?? 120) - 2);
   const offset = getLogScrollOffset(shellState, shellState.logView);
 
-  process.stdout.write(`Logs (${shellState.logView}, scroll +${offset}):\n`);
+  process.stdout.write(`${bold("Logs")} (${shellState.logView}, scroll +${offset}):\n`);
   if (logLines.length === 0) {
-    process.stdout.write("  (no logs yet)\n\n");
+    process.stdout.write(`  ${dim("(no logs yet)")}\n\n`);
     return;
   }
 
   for (const entry of logLines) {
-    const prefix = `[${entry.service}]`;
-    const line = `${prefix} ${entry.line}`;
+    const prefix = colorService(entry.service, `[${entry.service}]`);
+    const line = `${prefix} ${highlightErrorKeywords(entry.line)}`;
     process.stdout.write(`${truncateLine(line, width)}\n`);
   }
   process.stdout.write("\n");
@@ -128,7 +207,7 @@ function renderSplitLogPanel(shellState: ShellState): void {
   const serviceLogs = visibleServices.map((serviceName) => ({
     serviceName,
     offset: getLogScrollOffset(shellState, serviceName),
-    lines: getServiceLogs(shellState, serviceName, panelHeight).map((entry) => entry.line)
+    lines: getServiceLogs(shellState, serviceName, panelHeight).map((entry) => highlightErrorKeywords(entry.line))
   }));
   const maxLines = Math.max(
     panelHeight,
@@ -136,9 +215,12 @@ function renderSplitLogPanel(shellState: ShellState): void {
   );
   const titles = serviceLogs.map((item) => {
     const serviceLabel = item.serviceName.toUpperCase();
-    return splitFocus === item.serviceName
+    const label = splitFocus === item.serviceName
       ? `${serviceLabel}* (+${item.offset})`
       : `${serviceLabel} (+${item.offset})`;
+    return splitFocus === item.serviceName
+      ? bold(colorService(item.serviceName, label))
+      : colorService(item.serviceName, label);
   });
   const titleRow = titles.map((title) => padCell(title, columnWidth)).join(separator);
   const dividerRow = visibleServices.map(() => "-".repeat(columnWidth)).join(separator);
@@ -147,19 +229,23 @@ function renderSplitLogPanel(shellState: ShellState): void {
   const fullLabel = splitServices.join(" | ");
   const pageIndex = Math.floor(Math.max(0, splitServices.indexOf(splitFocus)) / splitPageSize);
   const pageCount = Math.ceil(splitServices.length / splitPageSize);
-  process.stdout.write(`Logs (split: ${showingLabel}) [page ${pageIndex + 1}/${pageCount} | all: ${fullLabel}]:\n`);
+  process.stdout.write(
+    `${bold("Logs")} (split: ${showingLabel}) ${dim(`[page ${pageIndex + 1}/${pageCount} | all: ${fullLabel}]`)}:\n`
+  );
   process.stdout.write(`${titleRow}\n`);
-  process.stdout.write(`${dividerRow}\n`);
+  process.stdout.write(`${dim(dividerRow)}\n`);
 
   for (let index = 0; index < maxLines; index += 1) {
     const row = serviceLogs
-      .map((item) => item.lines[index] ?? (index === 0 && item.lines.length === 0 ? "(no logs yet)" : ""))
+      .map((item) => item.lines[index] ?? (index === 0 && item.lines.length === 0 ? dim("(no logs yet)") : ""))
       .map((line) => padCell(line, columnWidth))
       .join(separator);
     process.stdout.write(`${row}\n`);
   }
 
-  process.stdout.write("Controls: [ prev pair | ] next pair | PgUp/PgDn scroll | Home/End latest\n");
+  process.stdout.write(
+    `${dim("Controls: [ prev pair | ] next pair | PgUp/PgDn scroll | Home/End latest")}\n`
+  );
   process.stdout.write("\n");
 }
 
@@ -177,7 +263,7 @@ function truncateLine(line: string, maxWidth: number): string {
     return sliceAnsiByVisibleWidth(line, maxWidth);
   }
   const truncated = sliceAnsiByVisibleWidth(line, maxWidth - 3);
-  return line.includes("\u001b[") ? `${truncated}...${ansiReset}` : `${truncated}...`;
+  return hasAnsi(line) ? `${truncated}...${getAnsiReset()}` : `${truncated}...`;
 }
 
 function padCell(line: string, width: number): string {
@@ -187,18 +273,33 @@ function padCell(line: string, width: number): string {
 }
 
 function drawBox(lines: string[]): string {
-  const width = lines.reduce((max, line) => Math.max(max, line.length), 0);
+  const width = lines.reduce((max, line) => Math.max(max, visibleLength(line)), 0);
   const top = `+${"-".repeat(width + 2)}+`;
-  const middle = lines.map((line) => `| ${line.padEnd(width, " ")} |`);
+  const middle = lines.map((line) => `| ${padVisible(line, width)} |`);
   return [top, ...middle, top].join("\n");
 }
 
-function colorRed(text: string): string {
-  if (!process.stdout.isTTY) {
-    return text;
-  }
+function padVisible(line: string, width: number): string {
+  const padding = Math.max(0, width - visibleLength(line));
+  return `${line}${" ".repeat(padding)}`;
+}
 
-  return `${ansiRed}${text}${ansiReset}`;
+function colorCategoryLabel(category: ShellCommandCategory): string {
+  const label = `[${shellCategoryLabels[category]}]`;
+  switch (category) {
+    case "api":
+      return bold(cyan(label));
+    case "logs":
+      return bold(yellow(label));
+    case "database":
+      return bold(green(label));
+    case "keywords":
+      return bold(colorService("sasa", label));
+    case "system":
+      return bold(dim(label));
+    default:
+      return bold(label);
+  }
 }
 
 function resolveVisibleSplitServices(splitFocus: ServiceName): ServiceName[] {
@@ -209,7 +310,7 @@ function resolveVisibleSplitServices(splitFocus: ServiceName): ServiceName[] {
 }
 
 function visibleLength(line: string): number {
-  return line.replace(ansiSgrPattern, "").length;
+  return stripAnsi(line).length;
 }
 
 function sliceAnsiByVisibleWidth(line: string, maxWidth: number): string {

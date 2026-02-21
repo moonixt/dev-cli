@@ -3,7 +3,10 @@ import path from "node:path";
 import { Command } from "commander";
 import { logPrefix, repoRoot } from "../../config";
 import type { DbResetOptions } from "../../types";
+import { bold, cyan, highlightErrorKeywords, yellow } from "../../utils/colors";
 import { runCommand } from "../../utils/process";
+
+const errorTag = bold(cyan(logPrefix, process.stderr), process.stderr);
 
 export function registerDbCommands(program: Command): void {
   const db = program.command("db").description("Database utilities");
@@ -31,7 +34,9 @@ export async function runDbResetWithOutput(
 ): Promise<number> {
   const sqlFilePath = path.join(repoRoot, "docs", "queryreset.txt");
   if (!fs.existsSync(sqlFilePath)) {
-    console.error(`${logPrefix} query file not found: ${sqlFilePath}`);
+    console.error(
+      `${errorTag} ${highlightErrorKeywords("query file not found:", process.stderr)} ${yellow(sqlFilePath, process.stderr)}`
+    );
     return 1;
   }
 
@@ -46,18 +51,31 @@ export async function runDbResetWithOutput(
     false;
 
   if (!server) {
-    console.error(`${logPrefix} missing SQL server. Use --server or DEV_CLI_SQL_SERVER.`);
+    console.error(
+      `${errorTag} ${highlightErrorKeywords("missing SQL server.", process.stderr)} ${yellow(
+        "Use --server or DEV_CLI_SQL_SERVER.",
+        process.stderr
+      )}`
+    );
     return 1;
   }
 
   if ((user && !password) || (!user && password)) {
-    console.error(`${logPrefix} provide both --user and --password (or env vars).`);
+    console.error(
+      `${errorTag} ${highlightErrorKeywords("provide both --user and --password", process.stderr)} ${yellow(
+        "(or env vars).",
+        process.stderr
+      )}`
+    );
     return 1;
   }
 
   if (!trusted && (!user || !password)) {
     console.error(
-      `${logPrefix} auth required. Use --trusted (or DEV_CLI_SQL_TRUSTED=1) or provide --user/--password.`
+      `${errorTag} ${highlightErrorKeywords("auth required.", process.stderr)} ${yellow(
+        "Use --trusted (or DEV_CLI_SQL_TRUSTED=1) or provide --user/--password.",
+        process.stderr
+      )}`
     );
     return 1;
   }
