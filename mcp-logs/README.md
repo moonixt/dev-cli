@@ -1,4 +1,4 @@
-# lemarsyn-mcp-logs
+# mcp-logs
 
 MCP server for log debugging and `dev-cli` command passthrough.
 
