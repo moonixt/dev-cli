@@ -1,4 +1,4 @@
-# LemarSyn Dev Tools (Standalone)
+# Dev Tools (Standalone)
 
 This folder contains standalone developer tools:
 
