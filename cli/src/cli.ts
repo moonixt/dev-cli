@@ -3,6 +3,7 @@
 import { Command } from "commander";
 import { registerStartCommand } from "./commands/api/start";
 import { registerDbCommands } from "./commands/db/reset";
+import { registerInitCommand } from "./commands/init";
 import { registerKeywordCommands } from "./commands/keywords";
 import { registerShellCommand } from "./commands/shell";
 import { cliVersion, logPrefix } from "./config";
@@ -18,6 +19,7 @@ registerStartCommand(program);
 registerShellCommand(program);
 registerDbCommands(program);
 registerKeywordCommands(program);
+registerInitCommand(program);
 loadCliEnv();
 
 if (process.argv.slice(2).length === 0) {

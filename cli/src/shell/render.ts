@@ -1,6 +1,5 @@
 import readline from "node:readline";
-import { cliVersion, repoRoot } from "../config";
-import { shellCategoryLabels, shellCategoryOrder, shellCommands } from "./commands";
+import { cliVersion } from "../config";
 import {
   getLogScrollOffset,
   getRunningSummary,
@@ -9,7 +8,7 @@ import {
   getVisibleLogs,
   isSuggestionRunning
 } from "./state";
-import type { ServiceName, ShellCommand, ShellCommandCategory, ShellState } from "../types";
+import type { ServiceId, ShellCommand, ShellState } from "../types";
 import {
   bold,
   colorService,
@@ -23,19 +22,19 @@ import {
   yellow
 } from "../utils/colors";
 
-const splitServices: ServiceName[] = ["api", "sasa", "frontend", "waha"];
 const splitPageSize = 2;
 
-export function printShellHelp(): void {
+export function printShellHelp(shellState: ShellState): void {
+  const shellCommands = shellState.commandCatalog.commands;
   const maxCommandLength = shellCommands.reduce((max, item) => Math.max(max, item.command.length), 0);
   const lines: string[] = [];
-  for (const category of shellCategoryOrder) {
+  for (const category of shellState.commandCatalog.categoryOrder) {
     const commandsByCategory = shellCommands.filter((item) => item.category === category);
     if (commandsByCategory.length === 0) {
       continue;
     }
 
-    lines.push(colorCategoryLabel(category));
+    lines.push(colorCategoryLabel(category, shellState));
     for (const item of commandsByCategory) {
       const paddedCommand = item.command.padEnd(maxCommandLength, " ");
       lines.push(`  ${cyan(paddedCommand)}  ${dim(item.description)}`);
@@ -56,7 +55,7 @@ export function renderLiveShell(input: string, selectedIndex: number, shellState
   renderLogPanel(shellState);
   process.stdout.write(`> ${input}`);
 
-  const suggestions = filterShellCommands(input);
+  const suggestions = filterShellCommands(input, shellState);
   if (suggestions.length === 0) {
     return;
   }
@@ -68,17 +67,18 @@ export function renderLiveShell(input: string, selectedIndex: number, shellState
   readline.cursorTo(process.stdout, input.length + 2);
 }
 
-export function filterShellCommands(input: string): ShellCommand[] {
+export function filterShellCommands(input: string, shellState: ShellState): ShellCommand[] {
   const normalized = normalizeCommandPrefix(input.trim().toLowerCase());
   if (!normalized.startsWith("/")) {
     return [];
   }
 
+  const commands = shellState.commandCatalog.commands;
   if (normalized === "/") {
-    return shellCommands;
+    return commands;
   }
 
-  return shellCommands.filter((item) => item.command.startsWith(normalized));
+  return commands.filter((item) => item.command.startsWith(normalized));
 }
 
 function renderSuggestions(
@@ -100,13 +100,13 @@ function renderSuggestions(
   let renderedLines = 1;
   let index = 0;
   process.stdout.write("\n");
-  for (const category of shellCategoryOrder) {
+  for (const category of shellState.commandCatalog.categoryOrder) {
     const byCategory = suggestions.filter((item) => item.category === category);
     if (byCategory.length === 0) {
       continue;
     }
 
-    process.stdout.write(`${colorCategoryLabel(category)}\n`);
+    process.stdout.write(`${colorCategoryLabel(category, shellState)}\n`);
     renderedLines += 1;
     for (const suggestion of byCategory) {
       process.stdout.write(renderSuggestionLine(suggestion, index === activeIndex, shellState));
@@ -121,9 +121,10 @@ function renderSuggestions(
 function renderSuggestionLine(suggestion: ShellCommand, isActive: boolean, shellState: ShellState): string {
   const marker = isActive ? green(">") : " ";
   const isRunning = isSuggestionRunning(suggestion.command, shellState);
-  const paddedCommand = suggestion.command.padEnd(18, " ");
+  const paddedCommand = suggestion.command.padEnd(20, " ");
   const commandText = isRunning ? yellow(paddedCommand) : cyan(paddedCommand);
-  const categoryText = dim(`[${shellCategoryLabels[suggestion.category]}]`);
+  const categoryLabel = shellState.commandCatalog.categoryLabels[suggestion.category] ?? suggestion.category;
+  const categoryText = dim(`[${categoryLabel}]`);
   const descriptionText = isRunning ? `${suggestion.description} ${yellow("running")}` : suggestion.description;
   return `${marker} ${categoryText} ${commandText} ${descriptionText}\n`;
 }
@@ -132,26 +133,22 @@ function normalizeCommandPrefix(input: string): string {
   if (input === "/keyword") {
     return "/keywords";
   }
-
   if (input.startsWith("/keyword ")) {
     return `/keywords ${input.slice(9)}`.trimEnd();
   }
-
   if (input === "/kw") {
     return "/keywords";
   }
-
   if (input.startsWith("/kw ")) {
     return `/keywords ${input.slice(4)}`.trimEnd();
   }
-
   return input;
 }
 
 function printShellHeader(shellState: ShellState): void {
   const lines = [
     `> ${bold(cyan("dev-cli"))} ${dim(`(${cliVersion})`)}`,
-    `${bold("workspace:")} ${repoRoot}`,
+    `${bold("workspace:")} ${shellState.workspaceRoot}`,
     `${bold("directory:")} ${process.cwd()}`,
     `${bold("running:")} ${getRunningSummary(shellState)}`,
     `${bold("log view:")} ${shellState.logView}`,
@@ -180,7 +177,6 @@ function renderLogPanel(shellState: ShellState): void {
   const logLines = getVisibleLogs(shellState, getLogPanelHeight());
   const width = Math.max(60, (process.stdout.columns ?? 120) - 2);
   const offset = getLogScrollOffset(shellState, shellState.logView);
-
   process.stdout.write(`${bold("Logs")} (${shellState.logView}, scroll +${offset}):\n`);
   if (logLines.length === 0) {
     process.stdout.write(`  ${dim("(no logs yet)")}\n\n`);
@@ -196,31 +192,34 @@ function renderLogPanel(shellState: ShellState): void {
 }
 
 function renderSplitLogPanel(shellState: ShellState): void {
+  const splitServices = shellState.serviceOrder;
+  if (splitServices.length === 0) {
+    process.stdout.write(`${bold("Logs")}:\n`);
+    process.stdout.write(`  ${dim("(no services configured)")}\n\n`);
+    return;
+  }
+
+  const splitFocus = getSplitLogFocus(shellState) ?? splitServices[0];
   const panelHeight = getLogPanelHeight();
   const width = Math.max(60, (process.stdout.columns ?? 120) - 2);
   const separator = " | ";
-  const splitFocus = getSplitLogFocus(shellState);
-  const visibleServices = resolveVisibleSplitServices(splitFocus);
+  const visibleServices = resolveVisibleSplitServices(splitFocus, splitServices);
   const separatorWidth = separator.length * (visibleServices.length - 1);
   const columnWidth = Math.max(18, Math.floor((width - separatorWidth) / visibleServices.length));
 
-  const serviceLogs = visibleServices.map((serviceName) => ({
-    serviceName,
-    offset: getLogScrollOffset(shellState, serviceName),
-    lines: getServiceLogs(shellState, serviceName, panelHeight).map((entry) => highlightErrorKeywords(entry.line))
+  const serviceLogs = visibleServices.map((serviceId) => ({
+    serviceId,
+    offset: getLogScrollOffset(shellState, serviceId),
+    lines: getServiceLogs(shellState, serviceId, panelHeight).map((entry) => highlightErrorKeywords(entry.line))
   }));
-  const maxLines = Math.max(
-    panelHeight,
-    ...serviceLogs.map((item) => item.lines.length)
-  );
+  const maxLines = Math.max(panelHeight, ...serviceLogs.map((item) => item.lines.length));
   const titles = serviceLogs.map((item) => {
-    const serviceLabel = item.serviceName.toUpperCase();
-    const label = splitFocus === item.serviceName
-      ? `${serviceLabel}* (+${item.offset})`
-      : `${serviceLabel} (+${item.offset})`;
-    return splitFocus === item.serviceName
-      ? bold(colorService(item.serviceName, label))
-      : colorService(item.serviceName, label);
+    const serviceLabel = item.serviceId.toUpperCase();
+    const label =
+      splitFocus === item.serviceId ? `${serviceLabel}* (+${item.offset})` : `${serviceLabel} (+${item.offset})`;
+    return splitFocus === item.serviceId
+      ? bold(colorService(item.serviceId, label))
+      : colorService(item.serviceId, label);
   });
   const titleRow = titles.map((title) => padCell(title, columnWidth)).join(separator);
   const dividerRow = visibleServices.map(() => "-".repeat(columnWidth)).join(separator);
@@ -251,7 +250,6 @@ function renderSplitLogPanel(shellState: ShellState): void {
 
 function getLogPanelHeight(): number {
   const rows = process.stdout.rows ?? 40;
-  // Reserve less space for chrome so logs stay readable.
   return Math.max(8, Math.min(24, rows - 14));
 }
 
@@ -284,25 +282,24 @@ function padVisible(line: string, width: number): string {
   return `${line}${" ".repeat(padding)}`;
 }
 
-function colorCategoryLabel(category: ShellCommandCategory): string {
-  const label = `[${shellCategoryLabels[category]}]`;
-  switch (category) {
-    case "api":
-      return bold(cyan(label));
-    case "logs":
-      return bold(yellow(label));
-    case "database":
-      return bold(green(label));
-    case "keywords":
-      return bold(colorService("sasa", label));
-    case "system":
-      return bold(dim(label));
-    default:
-      return bold(label);
+function colorCategoryLabel(category: string, shellState: ShellState): string {
+  const label = `[${shellState.commandCatalog.categoryLabels[category] ?? category}]`;
+  if (category === "logs") {
+    return bold(yellow(label));
   }
+  if (category === "database") {
+    return bold(green(label));
+  }
+  if (category === "keywords") {
+    return bold(colorService("sasa", label));
+  }
+  if (category === "system") {
+    return bold(dim(label));
+  }
+  return bold(cyan(label));
 }
 
-function resolveVisibleSplitServices(splitFocus: ServiceName): ServiceName[] {
+function resolveVisibleSplitServices(splitFocus: ServiceId, splitServices: ServiceId[]): ServiceId[] {
   const focusIndex = Math.max(0, splitServices.indexOf(splitFocus));
   const startIndex = Math.floor(focusIndex / splitPageSize) * splitPageSize;
   const visible = splitServices.slice(startIndex, startIndex + splitPageSize);

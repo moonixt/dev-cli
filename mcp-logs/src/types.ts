@@ -1,10 +1,9 @@
-export type ServiceName = "api" | "sasa" | "frontend" | "waha";
 export type LogStream = "stdout" | "stderr";
 export type LogLevel = "info" | "warn" | "error";
 
 export type LogEntry = {
   ts: string;
-  service: ServiceName;
+  service: string;
   stream: LogStream;
   level: LogLevel;
   msg: string;

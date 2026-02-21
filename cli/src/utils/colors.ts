@@ -1,4 +1,4 @@
-import type { ServiceName } from "../types";
+import type { ServiceId } from "../types";
 import { getErrorKeywordPattern } from "./error-keywords";
 
 const ansiReset = "\u001b[0m";
@@ -61,7 +61,7 @@ export function cyan(text: string, stream: ColorStream = process.stdout): string
   return applyColor(text, "36", stream);
 }
 
-export function colorService(service: ServiceName, text: string, stream: ColorStream = process.stdout): string {
+export function colorService(service: ServiceId, text: string, stream: ColorStream = process.stdout): string {
   switch (service) {
     case "api":
       return cyan(text, stream);
@@ -72,7 +72,7 @@ export function colorService(service: ServiceName, text: string, stream: ColorSt
     case "waha":
       return yellow(text, stream);
     default:
-      return text;
+      return blue(text, stream);
   }
 }
 

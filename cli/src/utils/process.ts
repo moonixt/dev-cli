@@ -48,4 +48,11 @@ export function terminateProcess(child: ChildProcess): void {
   }
 
   child.kill("SIGTERM");
+  const gracefulStopMs = 8_000;
+  setTimeout(() => {
+    if (child.exitCode !== null || child.killed) {
+      return;
+    }
+    child.kill("SIGKILL");
+  }, gracefulStopMs).unref();
 }

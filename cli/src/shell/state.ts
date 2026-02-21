@@ -6,24 +6,35 @@ import type {
   BackgroundService,
   LogView,
   RunTarget,
-  ServiceConfig,
+  ServiceId,
   ServiceLogEntry,
-  ServiceName,
+  ServiceRuntimeConfig,
+  ShellCommandCatalog,
   ShellState
 } from "../types";
 import { terminateProcess } from "../utils/process";
 import { appendServiceLogLine } from "../utils/service-log-file";
 
 const maxShellLogLines = 1000;
-const serviceOrder: ServiceName[] = ["api", "sasa", "frontend", "waha"];
 
-export function createShellState(): ShellState {
+export function createShellState(
+  serviceOrder: ServiceId[],
+  allTargets: ServiceId[],
+  commandCatalog: ShellCommandCatalog,
+  workspaceRoot: string,
+  workspaceName: string
+): ShellState {
   return {
-    running: new Map<ServiceName, BackgroundService>(),
+    running: new Map<ServiceId, BackgroundService>(),
     logs: [],
     logView: "off",
-    logScrollOffset: { api: 0, sasa: 0, frontend: 0, waha: 0 },
-    splitLogFocus: "api",
+    logScrollOffset: new Map(serviceOrder.map((serviceId) => [serviceId, 0])),
+    splitLogFocus: serviceOrder[0] ?? null,
+    serviceOrder: [...serviceOrder],
+    allTargets: [...allTargets],
+    commandCatalog,
+    workspaceRoot,
+    workspaceName,
     message: ""
   };
 }
@@ -47,11 +58,16 @@ export function getRunningSummary(shellState: ShellState): string {
     return "none";
   }
 
-  const parts = serviceOrder
-    .filter((serviceName) => shellState.running.has(serviceName))
-    .map((serviceName) => {
-      const running = shellState.running.get(serviceName);
-      return `${serviceName} (${running?.pid ?? "?"})`;
+  const orderedIds = [
+    ...shellState.serviceOrder,
+    ...Array.from(shellState.running.keys()).filter((serviceId) => !shellState.serviceOrder.includes(serviceId))
+  ];
+  const unique = Array.from(new Set(orderedIds));
+  const parts = unique
+    .filter((serviceId) => shellState.running.has(serviceId))
+    .map((serviceId) => {
+      const running = shellState.running.get(serviceId);
+      return `${serviceId} (${running?.pid ?? "?"})`;
     });
 
   return parts.join(", ");
@@ -66,10 +82,9 @@ export function setLogView(shellState: ShellState, view: LogView): void {
 
 export function clearLogs(shellState: ShellState): void {
   shellState.logs = [];
-  shellState.logScrollOffset.api = 0;
-  shellState.logScrollOffset.sasa = 0;
-  shellState.logScrollOffset.frontend = 0;
-  shellState.logScrollOffset.waha = 0;
+  for (const serviceId of shellState.serviceOrder) {
+    shellState.logScrollOffset.set(serviceId, 0);
+  }
   if (shellState.onChange) {
     shellState.onChange();
   }
@@ -85,28 +100,32 @@ export function getVisibleLogs(shellState: ShellState, limit: number): ServiceLo
   }
 
   const filtered = shellState.logs.filter((entry) => entry.service === shellState.logView);
-  return sliceWithOffset(filtered, limit, shellState.logScrollOffset[shellState.logView]);
+  return sliceWithOffset(filtered, limit, getLogScrollOffset(shellState, shellState.logView));
 }
 
-export function getServiceLogs(shellState: ShellState, serviceName: ServiceName, limit: number): ServiceLogEntry[] {
-  const filtered = shellState.logs.filter((entry) => entry.service === serviceName);
-  return sliceWithOffset(filtered, limit, shellState.logScrollOffset[serviceName]);
+export function getServiceLogs(shellState: ShellState, serviceId: ServiceId, limit: number): ServiceLogEntry[] {
+  const filtered = shellState.logs.filter((entry) => entry.service === serviceId);
+  return sliceWithOffset(filtered, limit, getLogScrollOffset(shellState, serviceId));
 }
 
-export function getSplitLogFocus(shellState: ShellState): ServiceName {
+export function getSplitLogFocus(shellState: ShellState): ServiceId | null {
   return shellState.splitLogFocus;
 }
 
-export function getLogScrollOffset(shellState: ShellState, serviceName: ServiceName): number {
-  return shellState.logScrollOffset[serviceName];
+export function getLogScrollOffset(shellState: ShellState, serviceId: ServiceId): number {
+  return shellState.logScrollOffset.get(serviceId) ?? 0;
 }
 
-export function setSplitLogFocus(shellState: ShellState, serviceName: ServiceName): void {
-  if (shellState.splitLogFocus === serviceName) {
+export function setSplitLogFocus(shellState: ShellState, serviceId: ServiceId): void {
+  if (!shellState.serviceOrder.includes(serviceId)) {
     return;
   }
 
-  shellState.splitLogFocus = serviceName;
+  if (shellState.splitLogFocus === serviceId) {
+    return;
+  }
+
+  shellState.splitLogFocus = serviceId;
   if (shellState.onChange) {
     shellState.onChange();
   }
@@ -116,22 +135,31 @@ export function scrollFocusedLog(
   shellState: ShellState,
   delta: number,
   visibleLines: number
-): { changed: boolean; service: ServiceName; offset: number } {
+): { changed: boolean; service: ServiceId | null; offset: number } {
   const targetService = resolveFocusedService(shellState);
+  if (!targetService) {
+    return { changed: false, service: null, offset: 0 };
+  }
+
   const changed = scrollServiceLogs(shellState, targetService, delta, visibleLines);
   return {
     changed,
     service: targetService,
-    offset: shellState.logScrollOffset[targetService]
+    offset: getLogScrollOffset(shellState, targetService)
   };
 }
 
 export function resetFocusedLogScroll(
   shellState: ShellState
-): { changed: boolean; service: ServiceName; offset: number } {
+): { changed: boolean; service: ServiceId | null; offset: number } {
   const targetService = resolveFocusedService(shellState);
-  const changed = shellState.logScrollOffset[targetService] !== 0;
-  shellState.logScrollOffset[targetService] = 0;
+  if (!targetService) {
+    return { changed: false, service: null, offset: 0 };
+  }
+
+  const currentOffset = getLogScrollOffset(shellState, targetService);
+  const changed = currentOffset !== 0;
+  shellState.logScrollOffset.set(targetService, 0);
   if (changed && shellState.onChange) {
     shellState.onChange();
   }
@@ -139,21 +167,31 @@ export function resetFocusedLogScroll(
   return {
     changed,
     service: targetService,
-    offset: shellState.logScrollOffset[targetService]
+    offset: getLogScrollOffset(shellState, targetService)
   };
 }
 
 export function startBackground(
   target: RunTarget,
-  services: Record<ServiceName, ServiceConfig>,
+  services: Record<ServiceId, ServiceRuntimeConfig>,
   shellState: ShellState
 ): number {
-  const targets: ServiceName[] = target === "all" ? serviceOrder : [target];
+  const targets = target === "all" ? shellState.allTargets : [target];
+  if (targets.length === 0) {
+    writeShellOutput(shellState, 'no services configured. run "dev-cli init"');
+    return 1;
+  }
+
   const messages: string[] = [];
   let hasError = false;
-
-  for (const serviceName of targets) {
-    const result = startServiceInBackground(serviceName, services[serviceName], shellState);
+  for (const serviceId of targets) {
+    const service = services[serviceId];
+    if (!service) {
+      messages.push(`unknown service: ${serviceId}`);
+      hasError = true;
+      continue;
+    }
+    const result = startServiceInBackground(serviceId, service, shellState);
     messages.push(result.message);
     if (!result.ok) {
       hasError = true;
@@ -166,15 +204,19 @@ export function startBackground(
 
 export function stopBackground(
   target: RunTarget,
-  services: Record<ServiceName, ServiceConfig>,
+  services: Record<ServiceId, ServiceRuntimeConfig>,
   shellState: ShellState
 ): number {
-  const targets: ServiceName[] = target === "all" ? serviceOrder : [target];
+  const targets = target === "all" ? shellState.allTargets : [target];
+  if (targets.length === 0) {
+    writeShellOutput(shellState, 'no services configured. run "dev-cli init"');
+    return 1;
+  }
+
   const messages: string[] = [];
   let hasError = false;
-
-  for (const serviceName of targets) {
-    const result = stopServiceInBackground(serviceName, shellState, services[serviceName]);
+  for (const serviceId of targets) {
+    const result = stopServiceInBackground(serviceId, shellState, services[serviceId]);
     messages.push(result.message);
     if (!result.ok) {
       hasError = true;
@@ -185,118 +227,94 @@ export function stopBackground(
   return hasError ? 1 : 0;
 }
 
-export function stopAllRunning(shellState: ShellState, services?: Record<ServiceName, ServiceConfig>): void {
+export function stopAllRunning(
+  shellState: ShellState,
+  services?: Record<ServiceId, ServiceRuntimeConfig>
+): void {
   const active = Array.from(shellState.running.keys());
-  for (const serviceName of active) {
-    const running = shellState.running.get(serviceName);
-    if (!running) {
+  for (const serviceId of active) {
+    const running = shellState.running.get(serviceId);
+    if (!running || running.external) {
       continue;
     }
-
-    if (running.external) {
-      continue;
-    }
-
-    stopServiceInBackground(serviceName, shellState, services?.[serviceName]);
+    stopServiceInBackground(serviceId, shellState, services?.[serviceId]);
   }
 }
 
 export function hydrateRunningServices(
   shellState: ShellState,
-  services: Record<ServiceName, ServiceConfig>
+  services: Record<ServiceId, ServiceRuntimeConfig>
 ): void {
-  for (const serviceName of serviceOrder) {
-    if (shellState.running.has(serviceName)) {
+  for (const serviceId of shellState.serviceOrder) {
+    if (shellState.running.has(serviceId)) {
       continue;
     }
 
-    const service = services[serviceName];
-    const pid = service.dockerContainerId
-      ? findRunningDockerContainerPid(service)
-      : findRunningProcessByCwd(service);
+    const service = services[serviceId];
+    if (!service) {
+      continue;
+    }
 
+    const pid = findRunningProcessByCwd(service);
     if (!pid || pid <= 0) {
       continue;
     }
-
-    shellState.running.set(serviceName, { pid, external: true });
+    shellState.running.set(serviceId, { pid, external: true });
   }
 }
 
 export function attachExternalLogStreams(
-  shellState: ShellState,
-  services: Record<ServiceName, ServiceConfig>,
-  targets: ServiceName[]
+  _shellState: ShellState,
+  _services: Record<ServiceId, ServiceRuntimeConfig>,
+  _targets: ServiceId[]
 ): void {
-  for (const serviceName of targets) {
-    const running = shellState.running.get(serviceName);
-    if (!running?.external || running.child) {
-      continue;
-    }
-
-    const service = services[serviceName];
-    // Today only WAHA has a safe way to attach history + follow logs for an existing process.
-    if (!service.dockerContainerId) {
-      continue;
-    }
-
-    const result = startServiceInBackground(serviceName, service, shellState);
-    if (!result.ok) {
-      writeShellOutput(shellState, result.message);
-    }
-  }
+  // Generic process discovery can detect external PIDs by cwd, but there is no safe
+  // cross-platform way to attach stdout/stderr streams to an already-running process.
 }
 
 export function isSuggestionRunning(command: string, shellState: ShellState): boolean {
-  if (command === "/start api") {
-    return shellState.running.has("api");
-  }
-
-  if (command === "/start sasa") {
-    return shellState.running.has("sasa");
-  }
-
-  if (command === "/start frontend") {
-    return shellState.running.has("frontend");
-  }
-
-  if (command === "/start waha") {
-    return shellState.running.has("waha");
-  }
-
   if (command === "/start all") {
-    return serviceOrder.every((serviceName) => shellState.running.has(serviceName));
+    if (shellState.allTargets.length === 0) {
+      return false;
+    }
+    return shellState.allTargets.every((serviceId) => shellState.running.has(serviceId));
   }
 
-  return false;
+  const match = command.match(/^\/start\s+([a-z0-9][a-z0-9-_]{1,31})$/i);
+  if (!match) {
+    return false;
+  }
+  const serviceId = match[1].toLowerCase();
+  return shellState.running.has(serviceId);
 }
 
-function resolveFocusedService(shellState: ShellState): ServiceName {
-  if (shellState.logView === "api" || shellState.logView === "sasa" || shellState.logView === "frontend" || shellState.logView === "waha") {
+function resolveFocusedService(shellState: ShellState): ServiceId | null {
+  if (
+    shellState.logView !== "off" &&
+    shellState.logView !== "all" &&
+    shellState.serviceOrder.includes(shellState.logView)
+  ) {
     return shellState.logView;
   }
 
-  return shellState.splitLogFocus;
+  if (shellState.splitLogFocus && shellState.serviceOrder.includes(shellState.splitLogFocus)) {
+    return shellState.splitLogFocus;
+  }
+
+  return shellState.serviceOrder[0] ?? null;
 }
 
 function startServiceInBackground(
-  serviceName: ServiceName,
-  service: ServiceConfig,
+  serviceId: ServiceId,
+  service: ServiceRuntimeConfig,
   shellState: ShellState
 ): { ok: boolean; message: string } {
-  if (shellState.running.has(serviceName)) {
-    const existing = shellState.running.get(serviceName);
-    if (existing?.external && service.dockerContainerId) {
-      shellState.running.delete(serviceName);
+  if (shellState.running.has(serviceId)) {
+    const existing = shellState.running.get(serviceId);
+    if (existing?.external) {
+      shellState.running.delete(serviceId);
     } else {
-      return { ok: false, message: `${serviceName} already running (${existing?.pid ?? "?"})` };
-    }
-  }
-
-  if (service.dockerContainerId) {
-    const ensureRunning = ensureDockerContainerRunning(service);
-    if (!ensureRunning.ok) {
-      return { ok: false, message: `${serviceName} failed to start container: ${ensureRunning.message}` };
+      return { ok: false, message: `${serviceId} already running (${existing?.pid ?? "?"})` };
     }
   }
 
@@ -307,6 +325,7 @@ function startServiceInBackground(
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
+        ...service.env,
         FORCE_COLOR: process.env.FORCE_COLOR ?? "1",
         CLICOLOR_FORCE: process.env.CLICOLOR_FORCE ?? "1"
       },
@@ -314,93 +333,75 @@ function startServiceInBackground(
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return { ok: false, message: `${serviceName} failed to spawn: ${message}` };
+    return { ok: false, message: `${serviceId} failed to spawn: ${message}` };
   }
 
   child.on("error", (error) => {
-    const running = shellState.running.get(serviceName);
+    const running = shellState.running.get(serviceId);
     if (running?.child === child) {
-      shellState.running.delete(serviceName);
+      shellState.running.delete(serviceId);
     }
-    writeShellOutput(shellState, `${serviceName} error: ${error.message}`);
+    writeShellOutput(shellState, `${serviceId} error: ${error.message}`);
   });
 
   const pid = child.pid;
   if (!pid) {
-    return { ok: false, message: `${serviceName} failed to start (${service.command})` };
+    return { ok: false, message: `${serviceId} failed to start (${service.command})` };
   }
 
-  shellState.running.set(serviceName, { child, pid });
-  attachStreamReader(serviceName, "stdout", child.stdout, shellState);
-  attachStreamReader(serviceName, "stderr", child.stderr, shellState);
+  shellState.running.set(serviceId, { child, pid });
+  attachStreamReader(serviceId, "stdout", child.stdout, service, shellState);
+  attachStreamReader(serviceId, "stderr", child.stderr, service, shellState);
 
   child.on("exit", (code, signal) => {
-    const running = shellState.running.get(serviceName);
+    const running = shellState.running.get(serviceId);
     if (running?.child === child) {
-      shellState.running.delete(serviceName);
+      shellState.running.delete(serviceId);
     }
 
     if (signal || code !== 0) {
       const reason = signal ? `signal ${signal}` : `code ${code}`;
-      writeShellOutput(shellState, `${serviceName} stopped (${reason})`);
+      writeShellOutput(shellState, `${serviceId} stopped (${reason})`);
     } else {
-      writeShellOutput(shellState, `${serviceName} stopped`);
+      writeShellOutput(shellState, `${serviceId} stopped`);
     }
   });
 
-  return { ok: true, message: `${serviceName} started (${pid})` };
+  return { ok: true, message: `${serviceId} started (${pid})` };
 }
 
 function stopServiceInBackground(
-  serviceName: ServiceName,
+  serviceId: ServiceId,
   shellState: ShellState,
-  service?: ServiceConfig
+  _service?: ServiceRuntimeConfig
 ): { ok: boolean; message: string } {
-  const running = shellState.running.get(serviceName);
-  let processStopped = false;
-  let processMessage = `${serviceName} is not running`;
+  const running = shellState.running.get(serviceId);
+  let stopped = false;
+  let message = `${serviceId} is not running`;
 
   if (running?.external) {
-    processStopped = stopExternalProcessByPid(running.pid);
-    processMessage = processStopped ? `${serviceName} external process stopping` : `${serviceName} external process not found`;
-    if (processStopped) {
-      shellState.running.delete(serviceName);
+    stopped = stopExternalProcessByPid(running.pid);
+    message = stopped ? `${serviceId} external process stopping` : `${serviceId} external process not found`;
+    if (stopped) {
+      shellState.running.delete(serviceId);
     }
   } else if (running) {
-    shellState.running.delete(serviceName);
+    shellState.running.delete(serviceId);
     if (running.child) {
       terminateProcess(running.child);
-      processStopped = true;
-      processMessage = `${serviceName} stopping`;
+      stopped = true;
+      message = `${serviceId} stopping`;
     }
   }
 
-  if (!service?.dockerContainerId) {
-    return processStopped
-      ? { ok: true, message: processMessage }
-      : { ok: false, message: processMessage };
-  }
-
-  const containerStop = stopDockerContainer(service);
-  if (!processStopped && !containerStop.ok) {
-    return { ok: false, message: `${serviceName} is not running` };
-  }
-
-  if (processStopped && containerStop.ok) {
-    return { ok: true, message: `${serviceName} stopping | container stopping` };
-  }
-
-  if (processStopped && !containerStop.ok) {
-    return { ok: false, message: `${serviceName} stopping | container stop failed: ${containerStop.message}` };
-  }
-
-  return { ok: true, message: `${serviceName} container stopping` };
+  return stopped ? { ok: true, message } : { ok: false, message };
 }
 
 function attachStreamReader(
-  serviceName: ServiceName,
+  serviceId: ServiceId,
   streamType: "stdout" | "stderr",
   stream: Readable | null,
+  service: ServiceRuntimeConfig,
   shellState: ShellState
 ): void {
   if (!stream) {
@@ -409,20 +410,28 @@ function attachStreamReader(
 
   const rl = readline.createInterface({ input: stream });
   rl.on("line", (line) => {
-    addLog(shellState, {
-      service: serviceName,
-      stream: streamType,
-      line: sanitizeLogLine(line),
-      timestamp: Date.now()
-    });
+    addLog(
+      shellState,
+      {
+        service: serviceId,
+        stream: streamType,
+        line: sanitizeLogLine(line),
+        timestamp: Date.now(),
+        retentionDays: service.logRetentionDays
+      },
+      service.logEnabled
+    );
   });
 }
 
-function addLog(shellState: ShellState, entry: ServiceLogEntry): void {
-  appendServiceLogLine(entry);
+function addLog(shellState: ShellState, entry: ServiceLogEntry, persist: boolean): void {
+  if (persist) {
+    appendServiceLogLine(entry);
+  }
 
-  if (shellState.logScrollOffset[entry.service] > 0) {
-    shellState.logScrollOffset[entry.service] += 1;
+  const currentOffset = getLogScrollOffset(shellState, entry.service);
+  if (currentOffset > 0) {
+    shellState.logScrollOffset.set(entry.service, currentOffset + 1);
   }
 
   shellState.logs.push(entry);
@@ -475,85 +484,29 @@ function stopExternalProcessByPid(pid: number): boolean {
   }
 }
 
-function ensureDockerContainerRunning(service: ServiceConfig): { ok: boolean; message: string } {
-  if (!service.dockerContainerId) {
-    return { ok: true, message: "" };
-  }
-
-  const result = spawnSync(service.command, ["start", service.dockerContainerId], {
-    cwd: service.cwd,
-    env: process.env,
-    windowsHide: true,
-    encoding: "utf8"
-  });
-
-  if (result.error) {
-    return { ok: false, message: result.error.message };
-  }
-
-  if (result.status === 0) {
-    return { ok: true, message: "started" };
-  }
-
-  const stderr = (result.stderr ?? "").toString().trim();
-  const stdout = (result.stdout ?? "").toString().trim();
-  const combined = `${stdout} ${stderr}`.toLowerCase();
-  if (combined.includes("already running")) {
-    return { ok: true, message: "already running" };
-  }
-
-  return { ok: false, message: stderr || stdout || `exit code ${result.status ?? "?"}` };
-}
-
-function stopDockerContainer(service: ServiceConfig): { ok: boolean; message: string } {
-  if (!service.dockerContainerId) {
-    return { ok: true, message: "" };
-  }
-
-  const result = spawnSync(service.command, ["stop", service.dockerContainerId], {
-    cwd: service.cwd,
-    env: process.env,
-    windowsHide: true,
-    encoding: "utf8"
-  });
-
-  if (result.error) {
-    return { ok: false, message: result.error.message };
-  }
-
-  if (result.status === 0) {
-    return { ok: true, message: "stopped" };
-  }
-
-  const stderr = (result.stderr ?? "").toString().trim();
-  const stdout = (result.stdout ?? "").toString().trim();
-  const combined = `${stdout} ${stderr}`.toLowerCase();
-  if (combined.includes("is not running")) {
-    return { ok: false, message: "container not running" };
-  }
-
-  return { ok: false, message: stderr || stdout || `exit code ${result.status ?? "?"}` };
-}
-
 type ProcessSnapshot = {
   pid: number;
   commandLine: string;
 };
 
-function findRunningProcessByCwd(service: ServiceConfig): number | null {
+function findRunningProcessByCwd(service: ServiceRuntimeConfig): number | null {
   const processes = readProcessList();
   if (processes.length === 0) {
     return null;
   }
 
   const cwdNorm = normalizePathForMatch(service.cwd);
-  const match = processes.find((item) => normalizePathForMatch(item.commandLine).includes(cwdNorm));
+  const match = processes.find((item) => {
+    const commandNorm = normalizePathForMatch(item.commandLine);
+    return commandNorm.includes(cwdNorm) && item.pid !== process.pid;
+  });
   return match?.pid ?? null;
 }
 
 function readProcessList(): ProcessSnapshot[] {
   if (process.platform === "win32") {
-    const command = "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress";
+    const command =
+      "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress";
     const result = spawnSync("powershell", ["-NoProfile", "-Command", command], {
       windowsHide: true,
       encoding: "utf8"
@@ -610,33 +563,6 @@ function normalizePathForMatch(value: string): string {
   return path.normalize(value).replace(/\\/g, "/").toLowerCase();
 }
 
-function findRunningDockerContainerPid(service: ServiceConfig): number | null {
-  if (!service.dockerContainerId) {
-    return null;
-  }
-
-  const inspectFormat = "{{.State.Running}} {{.State.Pid}}";
-  const result = spawnSync(service.command, ["inspect", "-f", inspectFormat, service.dockerContainerId], {
-    cwd: service.cwd,
-    env: process.env,
-    windowsHide: true,
-    encoding: "utf8"
-  });
-
-  if (result.error || result.status !== 0) {
-    return null;
-  }
-
-  const output = (result.stdout ?? "").toString().trim().toLowerCase();
-  if (!output.startsWith("true")) {
-    return null;
-  }
-
-  const pidText = output.split(/\s+/)[1] ?? "";
-  const pid = Number(pidText);
-  return Number.isFinite(pid) && pid > 0 ? pid : null;
-}
-
 function sliceWithOffset(entries: ServiceLogEntry[], limit: number, offset: number): ServiceLogEntry[] {
   if (entries.length === 0 || limit <= 0) {
     return [];
@@ -649,16 +575,21 @@ function sliceWithOffset(entries: ServiceLogEntry[], limit: number, offset: numb
   return entries.slice(start, end);
 }
 
-function scrollServiceLogs(shellState: ShellState, serviceName: ServiceName, delta: number, visibleLines: number): boolean {
-  const entries = shellState.logs.filter((entry) => entry.service === serviceName);
+function scrollServiceLogs(
+  shellState: ShellState,
+  serviceId: ServiceId,
+  delta: number,
+  visibleLines: number
+): boolean {
+  const entries = shellState.logs.filter((entry) => entry.service === serviceId);
   const maxOffset = Math.max(0, entries.length - Math.max(1, visibleLines));
-  const current = shellState.logScrollOffset[serviceName];
+  const current = getLogScrollOffset(shellState, serviceId);
   const next = Math.min(Math.max(0, current + delta), maxOffset);
   if (next === current) {
     return false;
   }
 
-  shellState.logScrollOffset[serviceName] = next;
+  shellState.logScrollOffset.set(serviceId, next);
   if (shellState.onChange) {
     shellState.onChange();
   }

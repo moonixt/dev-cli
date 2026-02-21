@@ -28,6 +28,19 @@ test("parseJsonLine parses valid JSONL entry", () => {
   assert.equal(parsed.level, "info");
 });
 
+test("parseJsonLine accepts non-fixed service names", () => {
+  const line = JSON.stringify({
+    ts: "2026-02-21T15:00:00.000Z",
+    service: "ruby-web",
+    stream: "stdout",
+    level: "info",
+    msg: "ok"
+  });
+  const parsed = LogStore.parseJsonLine(line);
+  assert.ok(parsed);
+  assert.equal(parsed.service, "ruby-web");
+});
+
 test("parseJsonLine ignores invalid JSONL entry", () => {
   const parsed = LogStore.parseJsonLine('{"ts":"bad","service":"api"}');
   assert.equal(parsed, null);

@@ -1,39 +1,42 @@
 import fs from "node:fs";
 import path from "node:path";
 import { logPrefix, repoRoot } from "../config";
-import type { PersistedLogEntry, ServiceLogEntry, ServiceLogLevel, ServiceName } from "../types";
+import type { PersistedLogEntry, ServiceLogEntry, ServiceLogLevel, ServiceId } from "../types";
 import { getErrorKeywordPattern } from "./error-keywords";
 
-const configuredLogRoot = process.env.DEV_CLI_LOG_ROOT?.trim();
-const logsDir = configuredLogRoot ? path.resolve(configuredLogRoot) : path.join(repoRoot, "logs");
-const servicesLogsRootPath = path.join(logsDir, "services");
-const legacyConsolidatedLogPath = path.join(logsDir, "dev-cli-services.txt");
-const retentionDays = 7;
+const defaultLogsDir = path.join(repoRoot, "logs");
+const defaultRetentionDays = 7;
 const warnKeywordsPattern = /\b(warn|warning|retry|deprecated|slow|throttle)\b/i;
+const serviceIdPattern = /^[a-z0-9][a-z0-9-_]{1,31}$/;
 const cleanupState = new Set<string>();
-let legacySessionHeaderWritten = false;
+const legacySessionHeaders = new Set<string>();
 let writeFailed = false;
 
 export function getServiceLogsRootPath(): string {
-  return servicesLogsRootPath;
+  return path.join(resolveLogsDir(), "services");
 }
 
 export function getLegacyConsolidatedLogPath(): string {
-  return legacyConsolidatedLogPath;
+  return path.join(resolveLogsDir(), "dev-cli-services.txt");
 }
 
-export function getServiceDailyLogPath(service: ServiceName, date: Date = new Date()): string {
+export function getServiceDailyLogPath(service: ServiceId, date: Date = new Date()): string {
+  validateServiceId(service);
   const day = formatDateUTC(date);
-  const serviceDir = path.join(servicesLogsRootPath, service);
+  const serviceDir = path.join(getServiceLogsRootPath(), service);
   return path.join(serviceDir, `${service}-${day}.txt`);
 }
 
-export function appendServiceLogLine(entry: Pick<ServiceLogEntry, "service" | "stream" | "line" | "timestamp">): void {
+export function appendServiceLogLine(
+  entry: Pick<ServiceLogEntry, "service" | "stream" | "line" | "timestamp"> & { retentionDays?: number }
+): void {
   try {
+    validateServiceId(entry.service);
     const message = normalizeMessage(entry.line);
     const date = new Date(entry.timestamp);
     const day = formatDateUTC(date);
     const level = resolveLogLevel(entry.stream, message);
+    const retentionDays = sanitizeRetentionDays(entry.retentionDays);
     const persisted: PersistedLogEntry = {
       ts: new Date(entry.timestamp).toISOString(),
       service: entry.service,
@@ -42,7 +45,7 @@ export function appendServiceLogLine(entry: Pick<ServiceLogEntry, "service" | "s
       msg: message
     };
 
-    writeServiceLogEntry(persisted, day);
+    writeServiceLogEntry(persisted, day, retentionDays);
     writeLegacyConsolidatedEntry(entry.service, entry.stream, persisted.ts, message);
   } catch (error) {
     if (writeFailed) {
@@ -54,38 +57,40 @@ export function appendServiceLogLine(entry: Pick<ServiceLogEntry, "service" | "s
   }
 }
 
-function writeServiceLogEntry(entry: PersistedLogEntry, day: string): void {
-  const serviceDir = path.join(servicesLogsRootPath, entry.service);
+function writeServiceLogEntry(entry: PersistedLogEntry, day: string, retentionDays: number): void {
+  const serviceDir = path.join(getServiceLogsRootPath(), entry.service);
   fs.mkdirSync(serviceDir, { recursive: true });
   const filePath = path.join(serviceDir, `${entry.service}-${day}.txt`);
   fs.appendFileSync(filePath, `${JSON.stringify(entry)}\n`, "utf8");
-  cleanupOldServiceLogFiles(entry.service, day);
+  cleanupOldServiceLogFiles(entry.service, day, retentionDays);
 }
 
 function writeLegacyConsolidatedEntry(
-  service: ServiceName,
+  service: ServiceId,
   stream: "stdout" | "stderr",
   timestamp: string,
   message: string
 ): void {
+  const logsDir = resolveLogsDir();
+  const legacyConsolidatedLogPath = getLegacyConsolidatedLogPath();
   fs.mkdirSync(logsDir, { recursive: true });
-  if (!legacySessionHeaderWritten) {
+  if (!legacySessionHeaders.has(legacyConsolidatedLogPath)) {
     fs.appendFileSync(legacyConsolidatedLogPath, `\n===== dev-cli log session ${new Date().toISOString()} =====\n`, "utf8");
-    legacySessionHeaderWritten = true;
+    legacySessionHeaders.add(legacyConsolidatedLogPath);
   }
 
   const output = `[${timestamp}] [${service}] [${stream}] ${message}\n`;
   fs.appendFileSync(legacyConsolidatedLogPath, output, "utf8");
 }
 
-function cleanupOldServiceLogFiles(service: ServiceName, day: string): void {
-  const stateKey = `${service}:${day}`;
+function cleanupOldServiceLogFiles(service: ServiceId, day: string, retentionDays: number): void {
+  const stateKey = `${getServiceLogsRootPath()}:${service}:${day}`;
   if (cleanupState.has(stateKey)) {
     return;
   }
   cleanupState.add(stateKey);
 
-  const serviceDir = path.join(servicesLogsRootPath, service);
+  const serviceDir = path.join(getServiceLogsRootPath(), service);
   if (!fs.existsSync(serviceDir)) {
     return;
   }
@@ -156,7 +161,7 @@ function parseDayToUtcDate(day: string): Date | null {
   return new Date(`${day}T00:00:00.000Z`);
 }
 
-function extractDayFromFileName(fileName: string, service: ServiceName): string | null {
+function extractDayFromFileName(fileName: string, service: ServiceId): string | null {
   const pattern = new RegExp(`^${service}-(\\d{4}-\\d{2}-\\d{2})\\.txt$`);
   const match = fileName.match(pattern);
   return match?.[1] ?? null;
@@ -164,4 +169,26 @@ function extractDayFromFileName(fileName: string, service: ServiceName): string 
 
 function stripAnsiSgr(value: string): string {
   return value.replace(/\u001b\[[0-9;?]*[ -/]*m/g, "");
+}
+
+function validateServiceId(service: string): void {
+  if (!serviceIdPattern.test(service)) {
+    throw new Error(`invalid service id for log persistence: ${service}`);
+  }
+}
+
+function sanitizeRetentionDays(value: number | undefined): number {
+  if (!Number.isFinite(value)) {
+    return defaultRetentionDays;
+  }
+  const numeric = Math.floor(value as number);
+  if (numeric < 1) {
+    return defaultRetentionDays;
+  }
+  return Math.min(numeric, 365);
+}
+
+function resolveLogsDir(): string {
+  const configuredLogRoot = process.env.DEV_CLI_LOG_ROOT?.trim();
+  return configuredLogRoot ? path.resolve(configuredLogRoot) : defaultLogsDir;
 }

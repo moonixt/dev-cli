@@ -6,11 +6,8 @@ import type {
   LogsListFilesResult,
   LogsListServicesResult,
   LogsSearchResult,
-  LogsTailResult,
-  ServiceName
+  LogsTailResult
 } from "./types";
-
-const knownServices: ServiceName[] = ["api", "sasa", "frontend", "waha"];
 
 type ServiceFile = {
   name: string;
@@ -32,7 +29,7 @@ export class LogStore {
   }
 
   listServices(): LogsListServicesResult {
-    const result = new Set<string>(knownServices);
+    const result = new Set<string>();
     if (fs.existsSync(this.logRoot)) {
       for (const item of fs.readdirSync(this.logRoot, { withFileTypes: true })) {
         if (item.isDirectory()) {
@@ -215,7 +212,7 @@ function isValidLogEntry(entry: Partial<LogEntry> | null | undefined): entry is 
     return false;
   }
 
-  const validService = typeof entry.service === "string" && knownServices.includes(entry.service as ServiceName);
+  const validService = typeof entry.service === "string" && entry.service.trim().length > 0;
   const validStream = entry.stream === "stdout" || entry.stream === "stderr";
   const validLevel = entry.level === "info" || entry.level === "warn" || entry.level === "error";
   const validTs = typeof entry.ts === "string" && Number.isFinite(new Date(entry.ts).getTime());

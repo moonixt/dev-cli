@@ -1,8 +1,9 @@
 import readline from "node:readline";
 import { Command } from "commander";
+import path from "node:path";
 import { runDbResetWithOutput } from "./db/reset";
-import { assertPathsExist, getServiceConfig } from "../services/service-config";
-import { shellCommandNames } from "../shell/commands";
+import { loadWorkspaceConfig } from "../services/config-loader";
+import { generateShellCommandCatalog } from "../shell/commands";
 import { filterShellCommands, printShellHelp, renderLiveShell, renderShellHome } from "../shell/render";
 import {
   attachExternalLogStreams,
@@ -20,7 +21,7 @@ import {
   stopBackground,
   writeShellOutput
 } from "../shell/state";
-import type { ServiceConfig, ServiceName, ShellState, StartCommandOptions } from "../types";
+import type { LoadedWorkspaceConfig, ServiceId, ServiceRuntimeConfig, ShellState } from "../types";
 import {
   addErrorKeyword,
   getErrorKeywords,
@@ -31,45 +32,63 @@ import {
   setErrorKeywords
 } from "../utils/error-keywords";
 import { getLegacyConsolidatedLogPath, getServiceLogsRootPath } from "../utils/service-log-file";
-import { normalizeTarget } from "../utils/target";
+import { resolveRunTarget } from "../utils/target";
 
-const splitOrder: ServiceName[] = ["api", "sasa", "frontend", "waha"];
+type ShellCommandOptions = {
+  config?: string;
+};
+
 const splitPageSize = 2;
-const defaultNpmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
-const defaultDockerCommand = "docker";
 
 export function registerShellCommand(program: Command): void {
   program
     .command("shell", { isDefault: true })
     .alias("ui")
     .description("Interactive terminal UI with slash commands")
-    .option("--dotnet <command>", "Override dotnet executable", "dotnet")
-    .option("--python <command>", "Override python executable", "python")
-    .option("--npm <command>", "Override npm executable", defaultNpmCommand)
-    .option("--docker <command>", "Override docker executable", defaultDockerCommand)
-    .action(async (options: StartCommandOptions) => {
-      const services = getServiceConfig(options.dotnet, options.python, options.npm, options.docker);
-      assertPathsExist(services);
-      process.exitCode = await runShell(services);
+    .option("--config <path>", "Path to dev-cli.config.json")
+    .action(async (options: ShellCommandOptions) => {
+      const workspace = loadWorkspaceConfig({
+        explicitConfigPath: options.config,
+        cwd: process.cwd()
+      });
+      process.env.DEV_CLI_LOG_ROOT = process.env.DEV_CLI_LOG_ROOT?.trim()
+        ? process.env.DEV_CLI_LOG_ROOT
+        : path.join(workspace.workspaceRoot, "logs");
+      process.exitCode = await runShell(workspace);
     });
 }
 
-async function runShell(services: Record<ServiceName, ServiceConfig>): Promise<number> {
-  const shellState = createShellState();
+async function runShell(workspace: LoadedWorkspaceConfig): Promise<number> {
+  const services = workspace.services;
+  const commandCatalog = generateShellCommandCatalog(services, workspace.serviceOrder);
+  const allTargets = workspace.groups.all?.length ? workspace.groups.all : workspace.serviceOrder;
+  const shellState = createShellState(
+    workspace.serviceOrder,
+    allTargets,
+    commandCatalog,
+    workspace.workspaceRoot,
+    workspace.workspaceName
+  );
+
   setShellMessage(
     shellState,
     `service logs dir: ${getServiceLogsRootPath()} | consolidated: ${getLegacyConsolidatedLogPath()}`
   );
+  if (workspace.serviceOrder.length === 0) {
+    setShellMessage(shellState, 'no services configured. run "dev-cli init" to create dev-cli.config.json');
+  }
+
   hydrateRunningServices(shellState, services);
   const externalServices = Array.from(shellState.running.entries())
     .filter(([, running]) => running.external)
-    .map(([serviceName]) => serviceName);
+    .map(([serviceId]) => serviceId);
   if (externalServices.length > 0) {
     setShellMessage(
       shellState,
       `detected running services: ${externalServices.join(", ")} | logs: ${getServiceLogsRootPath()}`
     );
   }
+
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     return runShellFallback(services, shellState);
   }
@@ -77,7 +96,7 @@ async function runShell(services: Record<ServiceName, ServiceConfig>): Promise<n
   return runShellVisual(services, shellState);
 }
 
-function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState: ShellState): Promise<number> {
+function runShellVisual(services: Record<ServiceId, ServiceRuntimeConfig>, shellState: ShellState): Promise<number> {
   return new Promise((resolve) => {
     const stdin = process.stdin;
     const logScrollStep = 5;
@@ -87,6 +106,7 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
     let selectedIndex = 0;
     let busy = false;
     let closed = false;
+
     const onSignal = (): void => {
       cleanup(130);
     };
@@ -97,7 +117,6 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
       }
 
       stopAllRunning(shellState, services);
-
       closed = true;
       stdin.off("keypress", onKeypress);
       process.off("SIGINT", onSignal);
@@ -113,10 +132,10 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
 
     const executeInput = async (): Promise<void> => {
       let command = input.trim();
-      const suggestions = filterShellCommands(input);
+      const suggestions = filterShellCommands(input, shellState);
       if (command.startsWith("/") && suggestions.length > 0) {
         const selected = suggestions[Math.max(0, Math.min(selectedIndex, suggestions.length - 1))];
-        const isExactCommand = shellCommandNames.includes(command);
+        const isExactCommand = shellState.commandCatalog.commandNames.includes(command);
         if (!isExactCommand) {
           command = selected.command;
         }
@@ -133,8 +152,6 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
         stdin.setRawMode(false);
       }
       if (suggestions.length > 0) {
-        // Cursor stays on the input row while suggestions are drawn below.
-        // Move to the bottom and clear so command output does not overlap suggestion text.
         readline.moveCursor(process.stdout, 0, suggestions.length);
       }
       readline.clearScreenDown(process.stdout);
@@ -166,12 +183,18 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
 
       if (shellState.logView === "all" && input.length === 0) {
         if (str === "[") {
-          setSplitLogFocus(shellState, previousSplitFocus(shellState.splitLogFocus));
-          return true;
+          const previous = previousSplitFocus(shellState.splitLogFocus, shellState.serviceOrder);
+          if (previous) {
+            setSplitLogFocus(shellState, previous);
+            return true;
+          }
         }
         if (str === "]") {
-          setSplitLogFocus(shellState, nextSplitFocus(shellState.splitLogFocus));
-          return true;
+          const next = nextSplitFocus(shellState.splitLogFocus, shellState.serviceOrder);
+          if (next) {
+            setSplitLogFocus(shellState, next);
+            return true;
+          }
         }
       }
 
@@ -179,27 +202,22 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
         scrollFocusedLog(shellState, logPageStep, getLogPanelHeight());
         return true;
       }
-
       if (key.name === "pagedown") {
         scrollFocusedLog(shellState, -logPageStep, getLogPanelHeight());
         return true;
       }
-
       if (key.name === "home") {
         scrollFocusedLog(shellState, Number.MAX_SAFE_INTEGER, getLogPanelHeight());
         return true;
       }
-
       if (key.name === "end") {
         resetFocusedLogScroll(shellState);
         return true;
       }
-
       if (key.ctrl && key.name === "up") {
         scrollFocusedLog(shellState, logScrollStep, getLogPanelHeight());
         return true;
       }
-
       if (key.ctrl && key.name === "down") {
         scrollFocusedLog(shellState, -logScrollStep, getLogPanelHeight());
         return true;
@@ -247,7 +265,7 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
       }
 
       if (key.name === "up" || key.name === "down") {
-        const suggestions = filterShellCommands(input || "/");
+        const suggestions = filterShellCommands(input || "/", shellState);
         if (suggestions.length === 0) {
           return;
         }
@@ -262,7 +280,7 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
       }
 
       if (key.name === "tab") {
-        const suggestions = filterShellCommands(input || "/");
+        const suggestions = filterShellCommands(input || "/", shellState);
         if (suggestions.length > 0) {
           const selected = suggestions[Math.max(0, Math.min(selectedIndex, suggestions.length - 1))];
           input = selected.command;
@@ -298,19 +316,29 @@ function runShellVisual(services: Record<ServiceName, ServiceConfig>, shellState
   });
 }
 
-function runShellFallback(services: Record<ServiceName, ServiceConfig>, shellState: ShellState): Promise<number> {
+function runShellFallback(services: Record<ServiceId, ServiceRuntimeConfig>, shellState: ShellState): Promise<number> {
   return new Promise((resolve) => {
     let lastExitCode = 0;
     let commandInProgress = false;
     let closing = false;
     const queue: string[] = [];
 
+    const completer = (input: string): [string[], string] => {
+      const trimmed = normalizeShellPrefix(input.trim());
+      const matches = shellState.commandCatalog.commandNames.filter((command) => command.startsWith(trimmed));
+      if (matches.length > 0) {
+        return [matches, input];
+      }
+      return [shellState.commandCatalog.commandNames, input];
+    };
+
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
       prompt: "> ",
-      completer: shellCompleter
+      completer
     });
+
     const onSignal = (): void => {
       if (closing) {
         return;
@@ -365,18 +393,9 @@ function runShellFallback(services: Record<ServiceName, ServiceConfig>, shellSta
   });
 }
 
-function shellCompleter(input: string): [string[], string] {
-  const trimmed = normalizeShellPrefix(input.trim());
-  const matches = shellCommandNames.filter((command) => command.startsWith(trimmed));
-  if (matches.length > 0) {
-    return [matches, input];
-  }
-  return [shellCommandNames, input];
-}
-
 async function handleShellInput(
   input: string,
-  services: Record<ServiceName, ServiceConfig>,
+  services: Record<ServiceId, ServiceRuntimeConfig>,
   shellState: ShellState
 ): Promise<{ continueShell: boolean; exitCode: number }> {
   if (!input) {
@@ -387,7 +406,7 @@ async function handleShellInput(
     if (shellState.onChange) {
       setShellMessage(shellState, "Use /start, /stop, /logs, /db, /keywords, /status, /clear, /exit");
     } else {
-      printShellHelp();
+      printShellHelp(shellState);
     }
     return { continueShell: true, exitCode: 0 };
   }
@@ -403,37 +422,6 @@ async function handleShellInput(
     return { continueShell: true, exitCode: 0 };
   }
 
-  if (input === "/logs clear") {
-    clearLogs(shellState);
-    setShellMessage(shellState, "logs cleared");
-    return { continueShell: true, exitCode: 0 };
-  }
-
-  if (input === "/logs" || input === "logs") {
-    setLogView(shellState, "all");
-    attachExternalLogStreams(shellState, services, splitOrder);
-    setShellMessage(shellState, "log view set to all");
-    return { continueShell: true, exitCode: 0 };
-  }
-
-  if (input === "/logs off") {
-    setLogView(shellState, "off");
-    setShellMessage(shellState, "logs hidden");
-    return { continueShell: true, exitCode: 0 };
-  }
-
-  if (input === "/logs all" || input === "/logs api" || input === "/logs sasa" || input === "/logs frontend" || input === "/logs waha") {
-    const view = (input.split(/\s+/)[1] ?? "all") as "all" | "api" | "sasa" | "frontend" | "waha";
-    setLogView(shellState, view);
-    if (view === "all") {
-      attachExternalLogStreams(shellState, services, splitOrder);
-    } else {
-      attachExternalLogStreams(shellState, services, [view]);
-    }
-    setShellMessage(shellState, `log view set to ${view}`);
-    return { continueShell: true, exitCode: 0 };
-  }
-
   if (input === "/exit" || input === "/quit" || input === "exit" || input === "quit") {
     return { continueShell: false, exitCode: 0 };
   }
@@ -443,10 +431,8 @@ async function handleShellInput(
     return { continueShell: true, exitCode: handleKeywordShellCommand(normalized, shellState) };
   }
 
-  if (normalized.startsWith("/start") || normalized.startsWith("/run")) {
-    const parts = normalized.split(/\s+/).filter(Boolean);
-    const target = normalizeTarget(parts[1] ?? "all");
-    return { continueShell: true, exitCode: startBackground(target, services, shellState) };
+  if (normalized.startsWith("/logs")) {
+    return handleLogsShellCommand(normalized, services, shellState);
   }
 
   if (normalized === "/db reset") {
@@ -455,33 +441,83 @@ async function handleShellInput(
     return { continueShell: true, exitCode };
   }
 
+  if (normalized.startsWith("/start") || normalized.startsWith("/run")) {
+    const parts = normalized.split(/\s+/).filter(Boolean);
+    try {
+      const target = resolveRunTarget(parts[1] ?? "all", shellState.serviceOrder);
+      return { continueShell: true, exitCode: startBackground(target, services, shellState) };
+    } catch (error) {
+      writeShellOutput(shellState, error instanceof Error ? error.message : String(error));
+      return { continueShell: true, exitCode: 1 };
+    }
+  }
+
   if (normalized.startsWith("/stop")) {
     const parts = normalized.split(/\s+/).filter(Boolean);
-    const target = normalizeTarget(parts[1] ?? "all");
-    return { continueShell: true, exitCode: stopBackground(target, services, shellState) };
+    try {
+      const target = resolveRunTarget(parts[1] ?? "all", shellState.serviceOrder);
+      return { continueShell: true, exitCode: stopBackground(target, services, shellState) };
+    } catch (error) {
+      writeShellOutput(shellState, error instanceof Error ? error.message : String(error));
+      return { continueShell: true, exitCode: 1 };
+    }
   }
 
   writeShellOutput(shellState, `Unknown command: ${input}`);
   return { continueShell: true, exitCode: 1 };
 }
 
+function handleLogsShellCommand(
+  normalized: string,
+  services: Record<ServiceId, ServiceRuntimeConfig>,
+  shellState: ShellState
+): { continueShell: boolean; exitCode: number } {
+  const parts = normalized.split(/\s+/).filter(Boolean);
+  const view = parts[1] ?? "all";
+
+  if (view === "clear") {
+    clearLogs(shellState);
+    setShellMessage(shellState, "logs cleared");
+    return { continueShell: true, exitCode: 0 };
+  }
+
+  if (view === "off") {
+    setLogView(shellState, "off");
+    setShellMessage(shellState, "logs hidden");
+    return { continueShell: true, exitCode: 0 };
+  }
+
+  if (view === "all") {
+    setLogView(shellState, "all");
+    attachExternalLogStreams(shellState, services, shellState.serviceOrder);
+    setShellMessage(shellState, "log view set to all");
+    return { continueShell: true, exitCode: 0 };
+  }
+
+  if (!shellState.serviceOrder.includes(view)) {
+    writeShellOutput(shellState, `Unknown log target: ${view}`);
+    return { continueShell: true, exitCode: 1 };
+  }
+
+  setLogView(shellState, view);
+  attachExternalLogStreams(shellState, services, [view]);
+  setShellMessage(shellState, `log view set to ${view}`);
+  return { continueShell: true, exitCode: 0 };
+}
+
 function normalizeShellPrefix(input: string): string {
   if (input === "/keyword") {
     return "/keywords";
   }
-
   if (input.startsWith("/keyword ")) {
     return `/keywords ${input.slice(9)}`.trimEnd();
   }
-
   if (input === "/kw") {
     return "/keywords";
   }
-
   if (input.startsWith("/kw ")) {
     return `/keywords ${input.slice(4)}`.trimEnd();
   }
-
   return input;
 }
 
@@ -509,7 +545,7 @@ function handleKeywordShellCommand(input: string, shellState: ShellState): numbe
   }
 
   if (action === "add") {
-    let rawKeyword = hasExplicitAction
+    const rawKeyword = hasExplicitAction
       ? input.replace(/^\/keywords\s+add\s*/i, "").trim()
       : tokens.slice(1).join(" ").trim();
     const keyword = stripMatchingQuotes(rawKeyword);
@@ -525,7 +561,6 @@ function handleKeywordShellCommand(input: string, shellState: ShellState): numbe
         setShellMessage(shellState, "keyword unchanged");
         return 0;
       }
-
       writeShellOutput(shellState, `keyword added: ${result.keyword}`);
       writeShellOutput(shellState, `keywords: ${formatKeywords(result.updatedKeywords)}`);
       setShellMessage(shellState, "keyword added");
@@ -538,7 +573,7 @@ function handleKeywordShellCommand(input: string, shellState: ShellState): numbe
   }
 
   if (action === "remove") {
-    let rawKeyword = input.replace(/^\/keywords\s+remove\s*/i, "").trim();
+    const rawKeyword = input.replace(/^\/keywords\s+remove\s*/i, "").trim();
     const keyword = stripMatchingQuotes(rawKeyword);
     if (!keyword) {
       writeShellOutput(shellState, "Usage: /keywords remove <keyword>");
@@ -552,7 +587,6 @@ function handleKeywordShellCommand(input: string, shellState: ShellState): numbe
         setShellMessage(shellState, "keyword not found");
         return 0;
       }
-
       writeShellOutput(shellState, `keyword removed: ${result.keyword}`);
       writeShellOutput(shellState, `keywords: ${formatKeywords(result.updatedKeywords)}`);
       setShellMessage(shellState, "keyword removed");
@@ -599,10 +633,11 @@ function parseShellTokens(input: string): string[] {
 }
 
 function stripMatchingQuotes(text: string): string {
-  if (text.length >= 2) {
-    if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
-      return text.slice(1, -1).trim();
-    }
+  if (
+    text.length >= 2 &&
+    ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'")))
+  ) {
+    return text.slice(1, -1).trim();
   }
   return text;
 }
@@ -611,21 +646,28 @@ function formatKeywords(keywords: string[]): string {
   return keywords.length > 0 ? keywords.join(", ") : "(none)";
 }
 
-function nextSplitFocus(current: ServiceName): ServiceName {
-  return shiftSplitFocusByPage(current, 1);
+function nextSplitFocus(current: ServiceId | null, serviceOrder: ServiceId[]): ServiceId | null {
+  return shiftSplitFocusByPage(current, serviceOrder, 1);
 }
 
-function previousSplitFocus(current: ServiceName): ServiceName {
-  return shiftSplitFocusByPage(current, -1);
+function previousSplitFocus(current: ServiceId | null, serviceOrder: ServiceId[]): ServiceId | null {
+  return shiftSplitFocusByPage(current, serviceOrder, -1);
 }
 
-function shiftSplitFocusByPage(current: ServiceName, direction: 1 | -1): ServiceName {
-  const pageCount = Math.ceil(splitOrder.length / splitPageSize);
-  const currentIndex = splitOrder.indexOf(current);
+function shiftSplitFocusByPage(
+  current: ServiceId | null,
+  serviceOrder: ServiceId[],
+  direction: 1 | -1
+): ServiceId | null {
+  if (serviceOrder.length === 0) {
+    return null;
+  }
+  const pageCount = Math.ceil(serviceOrder.length / splitPageSize);
+  const currentIndex = current ? serviceOrder.indexOf(current) : 0;
   const safeIndex = currentIndex >= 0 ? currentIndex : 0;
   const currentPage = Math.floor(safeIndex / splitPageSize);
   const columnOffset = safeIndex % splitPageSize;
   const nextPage = (currentPage + direction + pageCount) % pageCount;
-  const nextIndex = Math.min(nextPage * splitPageSize + columnOffset, splitOrder.length - 1);
-  return splitOrder[nextIndex];
+  const nextIndex = Math.min(nextPage * splitPageSize + columnOffset, serviceOrder.length - 1);
+  return serviceOrder[nextIndex];
 }

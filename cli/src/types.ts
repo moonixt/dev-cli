@@ -1,24 +1,56 @@
 import type { ChildProcess } from "node:child_process";
 
-export type RunTarget = "api" | "sasa" | "frontend" | "waha" | "all";
-export type ServiceName = "api" | "sasa" | "frontend" | "waha";
+export type ServiceId = string;
+export type RunTarget = ServiceId | "all";
 
-export type ServiceConfig = {
+export type ServiceRuntimeConfig = {
+  id: ServiceId;
+  label: string;
+  category: string;
   command: string;
   args: string[];
   cwd: string;
-  label: string;
-  dockerContainerId?: string;
+  env: Record<string, string>;
+  logEnabled: boolean;
+  logRetentionDays: number;
 };
 
-export type StartCommandOptions = {
-  dotnet: string;
-  python: string;
-  npm: string;
-  docker: string;
+export type WorkspaceServiceConfigFile = {
+  id: string;
+  label?: string;
+  category?: string;
+  cwd: string;
+  start: {
+    command: string;
+    args?: string[];
+  };
+  env?: Record<string, string>;
+  log?: {
+    enabled?: boolean;
+    retentionDays?: number;
+  };
+  health?: {
+    kind?: string;
+  };
 };
 
-export type ShellCommandCategory = "api" | "logs" | "database" | "keywords" | "system";
+export type WorkspaceConfigFile = {
+  version: number;
+  workspaceName?: string;
+  services: WorkspaceServiceConfigFile[];
+  groups?: Record<string, string[]>;
+};
+
+export type LoadedWorkspaceConfig = {
+  configPath: string | null;
+  workspaceRoot: string;
+  workspaceName: string;
+  services: Record<ServiceId, ServiceRuntimeConfig>;
+  serviceOrder: ServiceId[];
+  groups: Record<string, ServiceId[]>;
+};
+
+export type ShellCommandCategory = string;
 
 export type ShellCommand = {
   category: ShellCommandCategory;
@@ -26,20 +58,28 @@ export type ShellCommand = {
   description: string;
 };
 
-export type LogView = "off" | "all" | ServiceName;
+export type ShellCommandCatalog = {
+  commands: ShellCommand[];
+  commandNames: string[];
+  categoryOrder: string[];
+  categoryLabels: Record<string, string>;
+};
+
+export type LogView = "off" | "all" | ServiceId;
 
 export type ServiceLogEntry = {
-  service: ServiceName;
+  service: ServiceId;
   stream: "stdout" | "stderr";
   line: string;
   timestamp: number;
+  retentionDays?: number;
 };
 
 export type ServiceLogLevel = "info" | "warn" | "error";
 
 export type PersistedLogEntry = {
   ts: string;
-  service: ServiceName;
+  service: ServiceId;
   stream: "stdout" | "stderr";
   level: ServiceLogLevel;
   msg: string;
@@ -52,11 +92,16 @@ export type BackgroundService = {
 };
 
 export type ShellState = {
-  running: Map<ServiceName, BackgroundService>;
+  running: Map<ServiceId, BackgroundService>;
   logs: ServiceLogEntry[];
   logView: LogView;
-  logScrollOffset: Record<ServiceName, number>;
-  splitLogFocus: ServiceName;
+  logScrollOffset: Map<ServiceId, number>;
+  splitLogFocus: ServiceId | null;
+  serviceOrder: ServiceId[];
+  allTargets: ServiceId[];
+  commandCatalog: ShellCommandCatalog;
+  workspaceRoot: string;
+  workspaceName: string;
   message: string;
   onChange?: () => void;
 };

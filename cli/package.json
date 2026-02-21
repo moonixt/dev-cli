@@ -7,9 +7,10 @@
     "dev-cli": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
     "dev": "tsx src/cli.ts",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "test": "tsx --test test/**/*.test.ts"
   },
   "dependencies": {
     "commander": "^12.1.0",
