@@ -61,6 +61,10 @@ export function cyan(text: string, stream: ColorStream = process.stdout): string
   return applyColor(text, "36", stream);
 }
 
+export function blackOnWhite(text: string, stream: ColorStream = process.stdout): string {
+  return applyColor(text, "1;30;47", stream);
+}
+
 export function colorService(service: ServiceId, text: string, stream: ColorStream = process.stdout): string {
   switch (service) {
     case "api":

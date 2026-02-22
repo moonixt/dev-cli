@@ -19,6 +19,7 @@ import {
   startBackground,
   stopAllRunning,
   stopBackground,
+  toggleSplitLogMaximized,
   writeShellOutput
 } from "../shell/state";
 import type { LoadedWorkspaceConfig, ServiceId, ServiceRuntimeConfig, ShellState } from "../types";
@@ -106,9 +107,28 @@ function runShellVisual(services: Record<ServiceId, ServiceRuntimeConfig>, shell
     let selectedIndex = 0;
     let busy = false;
     let closed = false;
+    let queuedRender = false;
 
     const onSignal = (): void => {
       cleanup(130);
+    };
+
+    const requestRender = (): void => {
+      if (closed || busy || queuedRender) {
+        return;
+      }
+
+      queuedRender = true;
+      setImmediate(() => {
+        queuedRender = false;
+        if (!closed && !busy) {
+          renderLiveShell(input, selectedIndex, shellState);
+        }
+      });
+    };
+
+    const onResize = (): void => {
+      requestRender();
     };
 
     const cleanup = (exitCode: number): void => {
@@ -121,6 +141,7 @@ function runShellVisual(services: Record<ServiceId, ServiceRuntimeConfig>, shell
       stdin.off("keypress", onKeypress);
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
+      process.stdout.off("resize", onResize);
       shellState.onChange = undefined;
       if (stdin.isTTY) {
         stdin.setRawMode(false);
@@ -183,18 +204,30 @@ function runShellVisual(services: Record<ServiceId, ServiceRuntimeConfig>, shell
 
       if (shellState.logView === "all" && input.length === 0) {
         if (str === "[") {
-          const previous = previousSplitFocus(shellState.splitLogFocus, shellState.serviceOrder);
+          const previous = previousSplitFocus(
+            shellState.splitLogFocus,
+            shellState.serviceOrder,
+            shellState.splitLogMaximized ? "service" : "pair"
+          );
           if (previous) {
             setSplitLogFocus(shellState, previous);
             return true;
           }
         }
         if (str === "]") {
-          const next = nextSplitFocus(shellState.splitLogFocus, shellState.serviceOrder);
+          const next = nextSplitFocus(
+            shellState.splitLogFocus,
+            shellState.serviceOrder,
+            shellState.splitLogMaximized ? "service" : "pair"
+          );
           if (next) {
             setSplitLogFocus(shellState, next);
             return true;
           }
+        }
+        if (key.name === "m" && !key.ctrl && !key.meta) {
+          toggleSplitLogMaximized(shellState);
+          return true;
         }
       }
 
@@ -214,11 +247,11 @@ function runShellVisual(services: Record<ServiceId, ServiceRuntimeConfig>, shell
         resetFocusedLogScroll(shellState);
         return true;
       }
-      if (key.ctrl && key.name === "up") {
+      if (isFineScrollUpKey(str, key)) {
         scrollFocusedLog(shellState, logScrollStep, getLogPanelHeight());
         return true;
       }
-      if (key.ctrl && key.name === "down") {
+      if (isFineScrollDownKey(str, key)) {
         scrollFocusedLog(shellState, -logScrollStep, getLogPanelHeight());
         return true;
       }
@@ -306,10 +339,9 @@ function runShellVisual(services: Record<ServiceId, ServiceRuntimeConfig>, shell
     stdin.on("keypress", onKeypress);
     process.on("SIGINT", onSignal);
     process.on("SIGTERM", onSignal);
+    process.stdout.on("resize", onResize);
     shellState.onChange = () => {
-      if (!closed && !busy) {
-        renderLiveShell(input, selectedIndex, shellState);
-      }
+      requestRender();
     };
 
     renderLiveShell(input, selectedIndex, shellState);
@@ -646,11 +678,27 @@ function formatKeywords(keywords: string[]): string {
   return keywords.length > 0 ? keywords.join(", ") : "(none)";
 }
 
-function nextSplitFocus(current: ServiceId | null, serviceOrder: ServiceId[]): ServiceId | null {
+type SplitShiftMode = "pair" | "service";
+
+function nextSplitFocus(
+  current: ServiceId | null,
+  serviceOrder: ServiceId[],
+  mode: SplitShiftMode = "pair"
+): ServiceId | null {
+  if (mode === "service") {
+    return shiftSplitFocusByService(current, serviceOrder, 1);
+  }
   return shiftSplitFocusByPage(current, serviceOrder, 1);
 }
 
-function previousSplitFocus(current: ServiceId | null, serviceOrder: ServiceId[]): ServiceId | null {
+function previousSplitFocus(
+  current: ServiceId | null,
+  serviceOrder: ServiceId[],
+  mode: SplitShiftMode = "pair"
+): ServiceId | null {
+  if (mode === "service") {
+    return shiftSplitFocusByService(current, serviceOrder, -1);
+  }
   return shiftSplitFocusByPage(current, serviceOrder, -1);
 }
 
@@ -670,4 +718,50 @@ function shiftSplitFocusByPage(
   const nextPage = (currentPage + direction + pageCount) % pageCount;
   const nextIndex = Math.min(nextPage * splitPageSize + columnOffset, serviceOrder.length - 1);
   return serviceOrder[nextIndex];
+}
+
+function shiftSplitFocusByService(
+  current: ServiceId | null,
+  serviceOrder: ServiceId[],
+  direction: 1 | -1
+): ServiceId | null {
+  if (serviceOrder.length === 0) {
+    return null;
+  }
+
+  const currentIndex = current ? serviceOrder.indexOf(current) : 0;
+  const safeIndex = currentIndex >= 0 ? currentIndex : 0;
+  const nextIndex = (safeIndex + direction + serviceOrder.length) % serviceOrder.length;
+  return serviceOrder[nextIndex];
+}
+
+function isFineScrollUpKey(str: string, key: readline.Key): boolean {
+  if ((key.ctrl || key.meta) && key.name === "up") {
+    return true;
+  }
+  const sequence = key.sequence ?? str;
+  return isModifiedArrowSequence(sequence, "A");
+}
+
+function isFineScrollDownKey(str: string, key: readline.Key): boolean {
+  if ((key.ctrl || key.meta) && key.name === "down") {
+    return true;
+  }
+  const sequence = key.sequence ?? str;
+  return isModifiedArrowSequence(sequence, "B");
+}
+
+function isModifiedArrowSequence(sequence: string | undefined, directionCode: "A" | "B"): boolean {
+  if (!sequence) {
+    return false;
+  }
+
+  return (
+    sequence === `\u001b[1;5${directionCode}` ||
+    sequence === `\u001b[5${directionCode}` ||
+    sequence === `\u001b[1;3${directionCode}` ||
+    sequence === `\u001b[3${directionCode}` ||
+    sequence === `\u001bO5${directionCode}` ||
+    sequence === `\u001bO3${directionCode}`
+  );
 }

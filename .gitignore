@@ -1,0 +1,4 @@
+cli/node_modules
+mcp-logs/node_modules
+cli/dist
+mcp-logs/dist

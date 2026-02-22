@@ -30,6 +30,7 @@ export function createShellState(
     logView: "off",
     logScrollOffset: new Map(serviceOrder.map((serviceId) => [serviceId, 0])),
     splitLogFocus: serviceOrder[0] ?? null,
+    splitLogMaximized: false,
     serviceOrder: [...serviceOrder],
     allTargets: [...allTargets],
     commandCatalog,
@@ -75,6 +76,9 @@ export function getRunningSummary(shellState: ShellState): string {
 
 export function setLogView(shellState: ShellState, view: LogView): void {
   shellState.logView = view;
+  if (view !== "all") {
+    shellState.splitLogMaximized = false;
+  }
   if (shellState.onChange) {
     shellState.onChange();
   }
@@ -112,6 +116,10 @@ export function getSplitLogFocus(shellState: ShellState): ServiceId | null {
   return shellState.splitLogFocus;
 }
 
+export function getSplitLogMaximized(shellState: ShellState): boolean {
+  return shellState.splitLogMaximized;
+}
+
 export function getLogScrollOffset(shellState: ShellState, serviceId: ServiceId): number {
   return shellState.logScrollOffset.get(serviceId) ?? 0;
 }
@@ -129,6 +137,14 @@ export function setSplitLogFocus(shellState: ShellState, serviceId: ServiceId): 
   if (shellState.onChange) {
     shellState.onChange();
   }
+}
+
+export function toggleSplitLogMaximized(shellState: ShellState): boolean {
+  shellState.splitLogMaximized = !shellState.splitLogMaximized;
+  if (shellState.onChange) {
+    shellState.onChange();
+  }
+  return shellState.splitLogMaximized;
 }
 
 export function scrollFocusedLog(

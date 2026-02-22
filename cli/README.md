@@ -106,6 +106,7 @@ Inside shell:
 - `/logs all|off|clear`
 - `/status`
 - `/keywords ...`
+- In split logs (`/logs all`): press `M` to maximize/minimize focused logs; use `[` and `]` to change pair/service.
 
 ## Config Discovery Order
 

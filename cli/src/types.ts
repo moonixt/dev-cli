@@ -97,6 +97,7 @@ export type ShellState = {
   logView: LogView;
   logScrollOffset: Map<ServiceId, number>;
   splitLogFocus: ServiceId | null;
+  splitLogMaximized: boolean;
   serviceOrder: ServiceId[];
   allTargets: ServiceId[];
   commandCatalog: ShellCommandCatalog;

@@ -5,11 +5,13 @@ import {
   getRunningSummary,
   getServiceLogs,
   getSplitLogFocus,
+  getSplitLogMaximized,
   getVisibleLogs,
   isSuggestionRunning
 } from "./state";
 import type { ServiceId, ShellCommand, ShellState } from "../types";
 import {
+  blackOnWhite,
   bold,
   colorService,
   cyan,
@@ -45,26 +47,25 @@ export function printShellHelp(shellState: ShellState): void {
 }
 
 export function renderShellHome(shellState: ShellState): void {
-  console.clear();
+  clearTerminalFrame();
   printShellHeader(shellState);
 }
 
 export function renderLiveShell(input: string, selectedIndex: number, shellState: ShellState): void {
-  console.clear();
+  clearTerminalFrame();
   printShellHeader(shellState);
   renderLogPanel(shellState);
   process.stdout.write(`> ${input}`);
 
   const suggestions = filterShellCommands(input, shellState);
-  if (suggestions.length === 0) {
-    return;
+  if (suggestions.length > 0) {
+    const activeIndex = Math.max(0, Math.min(selectedIndex, suggestions.length - 1));
+    const renderedSuggestionLines = renderSuggestions(input, activeIndex, suggestions, shellState);
+    readline.moveCursor(process.stdout, 0, -(renderedSuggestionLines + 1));
+    readline.cursorTo(process.stdout, input.length + 2);
   }
 
-  const activeIndex = Math.max(0, Math.min(selectedIndex, suggestions.length - 1));
-  const renderedSuggestionLines = renderSuggestions(input, activeIndex, suggestions, shellState);
-
-  readline.moveCursor(process.stdout, 0, -(renderedSuggestionLines + 1));
-  readline.cursorTo(process.stdout, input.length + 2);
+  renderFooterControls(shellState);
 }
 
 export function filterShellCommands(input: string, shellState: ShellState): ShellCommand[] {
@@ -200,10 +201,11 @@ function renderSplitLogPanel(shellState: ShellState): void {
   }
 
   const splitFocus = getSplitLogFocus(shellState) ?? splitServices[0];
+  const splitMaximized = getSplitLogMaximized(shellState);
   const panelHeight = getLogPanelHeight();
   const width = Math.max(60, (process.stdout.columns ?? 120) - 2);
   const separator = " | ";
-  const visibleServices = resolveVisibleSplitServices(splitFocus, splitServices);
+  const visibleServices = splitMaximized ? [splitFocus] : resolveVisibleSplitServices(splitFocus, splitServices);
   const separatorWidth = separator.length * (visibleServices.length - 1);
   const columnWidth = Math.max(18, Math.floor((width - separatorWidth) / visibleServices.length));
 
@@ -224,13 +226,22 @@ function renderSplitLogPanel(shellState: ShellState): void {
   const titleRow = titles.map((title) => padCell(title, columnWidth)).join(separator);
   const dividerRow = visibleServices.map(() => "-".repeat(columnWidth)).join(separator);
 
-  const showingLabel = visibleServices.join(" | ");
   const fullLabel = splitServices.join(" | ");
-  const pageIndex = Math.floor(Math.max(0, splitServices.indexOf(splitFocus)) / splitPageSize);
+  const focusIndex = Math.max(0, splitServices.indexOf(splitFocus));
+  const pageIndex = Math.floor(focusIndex / splitPageSize);
   const pageCount = Math.ceil(splitServices.length / splitPageSize);
-  process.stdout.write(
-    `${bold("Logs")} (split: ${showingLabel}) ${dim(`[page ${pageIndex + 1}/${pageCount} | all: ${fullLabel}]`)}:\n`
-  );
+  if (splitMaximized) {
+    process.stdout.write(
+      `${bold("Logs")} (maximized: ${splitFocus}) ${dim(
+        `[service ${focusIndex + 1}/${splitServices.length} | all: ${fullLabel}]`
+      )}:\n`
+    );
+  } else {
+    const showingLabel = visibleServices.join(" | ");
+    process.stdout.write(
+      `${bold("Logs")} (split: ${showingLabel}) ${dim(`[page ${pageIndex + 1}/${pageCount} | all: ${fullLabel}]`)}:\n`
+    );
+  }
   process.stdout.write(`${titleRow}\n`);
   process.stdout.write(`${dim(dividerRow)}\n`);
 
@@ -242,15 +253,66 @@ function renderSplitLogPanel(shellState: ShellState): void {
     process.stdout.write(`${row}\n`);
   }
 
-  process.stdout.write(
-    `${dim("Controls: [ prev pair | ] next pair | PgUp/PgDn scroll | Home/End latest")}\n`
-  );
+  process.stdout.write("\n");
+}
+
+function renderFooterControls(shellState: ShellState): void {
+  if (!process.stdout.isTTY) {
+    return;
+  }
+
+  const width = Math.max(40, process.stdout.columns ?? 120);
+  const row = Math.max(1, process.stdout.rows ?? 40);
+  const line = formatFooterLine(shellState, width);
+  process.stdout.write("\u001b[s");
+  process.stdout.write(`\u001b[${row};1H`);
+  process.stdout.write("\u001b[2K");
+  process.stdout.write(line);
+  process.stdout.write("\u001b[u");
+}
+
+function formatFooterLine(shellState: ShellState, width: number): string {
+  const items = getFooterItems(shellState);
+  const joined = items.join("  ");
+  const truncated = truncateLine(joined, width);
+  const padding = Math.max(0, width - visibleLength(truncated));
+  return `${truncated}${" ".repeat(padding)}`;
+}
+
+function getFooterItems(shellState: ShellState): string[] {
+  const items = [footerItem("Enter", "run"), footerItem("/", "commands"), footerItem("Ctrl+C", "exit")];
+  if (shellState.logView === "off") {
+    items.push(footerItem("/logs all", "show logs"));
+    return items;
+  }
+
+  items.push(footerItem("PgUp/PgDn", "scroll"), footerItem("Home/End", "latest"));
+  items.push(footerItem("Ctrl/Alt+Up/Down", "fine scroll"));
+  if (shellState.logView === "all") {
+    const splitMaximized = getSplitLogMaximized(shellState);
+    items.push(footerItem("[ ]", splitMaximized ? "prev/next service" : "prev/next pair"));
+    items.push(footerItem("M", splitMaximized ? "minimize" : "maximize"));
+  }
+
+  return items;
+}
+
+function footerItem(shortcut: string, label: string): string {
+  return `${blackOnWhite(` ${shortcut} `)} ${label}`;
+}
+
+function clearTerminalFrame(): void {
+  if (process.stdout.isTTY) {
+    // Full clear + cursor home. More predictable than console.clear() across terminals.
+    process.stdout.write("\u001b[2J\u001b[H");
+    return;
+  }
   process.stdout.write("\n");
 }
 
 function getLogPanelHeight(): number {
   const rows = process.stdout.rows ?? 40;
-  return Math.max(8, Math.min(24, rows - 14));
+  return Math.max(8, Math.min(24, rows - 15));
 }
 
 function truncateLine(line: string, maxWidth: number): string {
